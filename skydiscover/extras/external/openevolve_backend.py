@@ -108,6 +108,10 @@ def _map_config(config: Config, iterations: Optional[int], output_dir: str):
 
     oe.diff_based_generation = config.diff_based_generation
 
+    # Map max_solution_length → max_code_length
+    if hasattr(config, "max_solution_length") and config.max_solution_length:
+        oe.max_code_length = config.max_solution_length
+
     return oe
 
 
@@ -276,8 +280,26 @@ async def run(
 
     initial_score = _get_initial_score(programs_dict)
 
+    # OpenEvolve's controller.run() sometimes returns a program whose metrics
+    # are stale / missing combined_score (e.g. {"error": 0.0, "timeout": true}).
+    # To be safe, scan the full database for the true best program.
+    best_score = _score_of(best.metrics) if best else None
+    db_best = best
+    for p in programs_dict.values():
+        s = _score_of(p.metrics)
+        if s is not None and (best_score is None or s > best_score):
+            best_score = s
+            db_best = p
+    if db_best is not best:
+        logger.warning(
+            "OpenEvolve controller returned program %s (score=%s) but database "
+            "contains better program %s (score=%s) — using database best.",
+            getattr(best, "id", "?"), _score_of(best.metrics) if best else None,
+            getattr(db_best, "id", "?"), best_score,
+        )
+        best = db_best
+
     best_skydiscover = _to_skydiscover_program(best) if best else None
-    best_score = _score_of(best.metrics) if best else 0.0
 
     return DiscoveryResult(
         best_program=best_skydiscover,

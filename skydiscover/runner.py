@@ -356,7 +356,7 @@ class Runner:
         setup_search_logging(log_level=self.config.log_level, log_dir=log_dir, name=self.name)
 
     def _load_initial_program(self) -> str:
-        with open(self.initial_program_path, "r") as f:
+        with open(self.initial_program_path, "r", encoding="utf-8") as f:
             return f.read()
 
     def _save_checkpoint(self, iteration: int) -> None:
@@ -369,7 +369,7 @@ class Runner:
         best = self._get_best_program()
         if best:
             with open(
-                os.path.join(checkpoint_path, f"best_program{self.file_extension}"), "w"
+                os.path.join(checkpoint_path, f"best_program{self.file_extension}"), "w", encoding="utf-8"
             ) as f:
                 f.write(best.solution)
             with open(os.path.join(checkpoint_path, "best_program_info.json"), "w") as f:
@@ -409,7 +409,7 @@ class Runner:
         os.makedirs(best_dir, exist_ok=True)
 
         code_path = os.path.join(best_dir, f"best_program{self.file_extension}")
-        with open(code_path, "w") as f:
+        with open(code_path, "w", encoding="utf-8") as f:
             f.write(program.solution)
 
         info_path = os.path.join(best_dir, "best_program_info.json")
