@@ -1,0 +1,101 @@
+# V2 Workload: Heavy-Hitter Prefix with Bursty Arrival
+# PURPOSE: Create TENSION between prefix-affinity and load-balance.
+#
+# WHAT THIS STRESSES: Load imbalance when one prefix group dominates traffic.
+#   60% of ALL traffic shares one large prefix (512 tokens). Prefix-affinity
+#   wants to send all of it to one instance (the one that cached this prefix),
+#   creating massive 2.4x overload on that instance. Meanwhile, critical traffic
+#   needs low-load instances. A good router must avoid the prefix-affinity trap.
+#
+# KEY DESIGN CHOICES:
+#   - 60% heavy-hitter (sheddable SLO): one prefix group gets 60% of all traffic.
+#     Worst case for prefix-affinity (concentrates load on one instance).
+#   - Very bursty arrival (gamma CV=4): traffic arrives in sharp bursts, making
+#     load spikes worse when concentrated on one instance.
+#   - 20% critical (no prefix): these requests need idle instances and will
+#     suffer if routed to the overloaded prefix-heavy instance.
+#   - 20% different prefix group (standard SLO): tests whether router can maintain
+#     SEPARATE cache affinity while managing the heavy group's load impact.
+#
+# VALIDATED RESULTS: TBD after v2 workload tuning
+#
+# DESIGN:
+#   - 5000 requests at rate=1000 -> 5 seconds simulated time
+#   - 60% heavy-prefix sheddable traffic (gamma CV=4, prefix=512)
+#   - 20% critical SLO (no prefix, needs idle instances)
+#   - 20% different prefix group, standard SLO
+
+version: "2"
+seed: 42
+category: language
+aggregate_rate: 1000.0
+num_requests: 5000
+
+clients:
+  # Heavy hitter: 60% of ALL traffic, large shared prefix, very bursty arrival.
+  # Prefix-affinity locks this to one instance → creates 2.4x average load there.
+  # Marked sheddable: signals "redistribute under load" to adaptive router.
+  - id: "heavy-prefix-batch"
+    slo_class: "sheddable"
+    rate_fraction: 0.60
+    streaming: false
+    arrival:
+      process: gamma
+      cv: 4.0
+    input_distribution:
+      type: gaussian
+      params:
+        mean: 400
+        std_dev: 120
+        min: 100
+        max: 800
+    output_distribution:
+      type: exponential
+      params:
+        mean: 120
+    prefix_group: "heavy-system-prompt"
+    prefix_length: 512  # Large prefix: prefix-affinity strongly favors cached instance
+
+  # Critical: needs low latency, must route AWAY from the heavy-prefix instance.
+  # No prefix → prefix-affinity gives 0 score → load-balance decides.
+  - id: "realtime-critical"
+    slo_class: "critical"
+    rate_fraction: 0.20
+    streaming: true
+    arrival:
+      process: poisson
+    input_distribution:
+      type: gaussian
+      params:
+        mean: 80
+        std_dev: 20
+        min: 30
+        max: 180
+    output_distribution:
+      type: exponential
+      params:
+        mean: 30
+    # No prefix group - pure load-balance routing
+
+  # Second prefix group: different prefix, steady arrival.
+  # Tests whether router can maintain cache affinity for this group
+  # while managing the heavy-prefix group's load impact.
+  - id: "light-prefix-interactive"
+    slo_class: "standard"
+    rate_fraction: 0.20
+    streaming: false
+    arrival:
+      process: poisson
+    input_distribution:
+      type: gaussian
+      params:
+        mean: 200
+        std_dev: 50
+        min: 80
+        max: 400
+    output_distribution:
+      type: exponential
+      params:
+        mean: 60
+    prefix_group: "light-system-prompt"
+    prefix_length: 384
