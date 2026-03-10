@@ -1,0 +1,12 @@
+admission:
+  policy: always-admit
+priority:
+  policy: constant
+routing:
+  policy: weighted
+  scorers:
+  - name: prefix-affinity
+    weight: 1.0
+  - name: load-balance
+    weight: 1.0
+scheduler: fcfs

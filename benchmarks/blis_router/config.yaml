@@ -1,0 +1,248 @@
+# ============================================================================
+# OpenEvolve Configuration: BLIS Router Weight Optimization
+# ============================================================================
+#
+# EXPERIMENT: Evolve adaptive routing weights for BLIS multi-instance cluster
+# GOAL: Minimize average end-to-end latency across workload patterns
+# BASELINE: Static weights (cache=1, load=1)
+# TARGET: 20-30% latency reduction through adaptive weight calculation
+#
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Execution Settings
+# ----------------------------------------------------------------------------
+
+# Total number of evolution iterations to run
+# 50 iterations = ~1-2 hours depending on BLIS simulation time
+# Each iteration: sample programs → LLM generates mutation → evaluate → update database
+max_iterations: 100
+
+# Save checkpoint every N iterations for resumability
+# Checkpoints include full database state, best program, and evolution progress
+checkpoint_interval: 5
+
+# Logging verbosity: DEBUG, INFO, WARNING, ERROR
+# INFO provides good balance between detail and readability
+log_level: "INFO"
+
+# ----------------------------------------------------------------------------
+# LLM Configuration
+# ----------------------------------------------------------------------------
+
+llm:
+  # Primary model for generating code mutations
+  # aws/claude-sonnet-4-5: High quality, good for code generation
+  # Alternative options: "GCP/claude-opus-4", "gcp/gemini-2.5-pro", "GCP/gemini-2.5-flash"
+  primary_model: aws/claude-sonnet-4-5
+
+  # Weight for primary model in ensemble (1.0 = use only primary)
+  # ADRS finding: 0.8/0.2 split is the standard pattern across all use cases
+  primary_model_weight: 0.8
+
+  # Optional: Secondary model for ensemble diversity
+  # Uncomment to enable two-model ensemble voting
+  secondary_model: aws/claude-opus-4-6
+  secondary_model_weight: 0.2
+
+  # Optional: API base URL for custom endpoints
+  # Uncomment if using custom LLM API endpoint
+  api_base: https://ete-litellm.ai-models.vpc-int.res.ibm.com
+
+  # Temperature controls randomness in LLM generation
+  # ADRS finding: most use cases use 0.7 (EPLB, LLM-SQL) or 0.9 (CBL)
+  # 0.7 = balanced creativity and consistency, avoids too-random mutations
+  temperature: 0.7
+
+  # Optional: Top-p (nucleus sampling) for generation diversity
+  # NOTE: AWS Bedrock (Claude) doesn't allow both temperature and top_p
+  # Set to null explicitly to avoid API error - using temperature only
+  top_p: null
+
+  # Maximum tokens in LLM response
+  # 16000 sufficient for routing.go file (~12KB source)
+  # Increase if evolving larger files
+  max_tokens: 40000
+
+  # Timeout for LLM API calls (seconds)
+  # 120s = 2 minutes, sufficient for most models
+  # Increase if using slower models or seeing timeout errors
+  timeout: 120
+
+# ----------------------------------------------------------------------------
+# Prompt Configuration
+# ----------------------------------------------------------------------------
+
+prompt:
+  # System message: Phase 1 (problem + context + evaluation, no strategy hints)
+  # ADRS finding: "Less is more" — excessive hints cause premature convergence.
+  # Strategy directions are held back for Phase 2 injection when scores plateau.
+  system_message: |
+    You are optimizing a request router for LLM inference.
+
+    GOAL: Beat the baseline by making routing more dynamic and context-aware.
+
+    BASELINE (what you're competing against):
+    - Uses two scorers (prefix-affinity and load-balance) with fixed equal weights [1.0, 1.0]
+    - Weights NEVER change based on request or system state
+
+    AVAILABLE SCORERS (all return scores in [0,1], higher = better):
+
+    1. prefix-affinity (USED BY BASELINE):
+       - Computes block hashes from req.InputTokens
+       - Looks up how many blocks each instance has cached (router-side tracking)
+       - score = matchedBlocks / totalBlocks
+       - Higher score = instance has more of this request's prefix cached
+
+    2. load-balance (USED BY BASELINE):
+       - score = 1.0 / (1.0 + EffectiveLoad)
+       - EffectiveLoad = QueueDepth + BatchSize + PendingRequests
+       - Higher score = instance has less load
+
+    3. queue-depth (NOT in baseline - available to add):
+       - Min-max normalization: score = (maxLoad - thisLoad) / (maxLoad - minLoad)
+       - All equal loads → all score 1.0
+
+    4. kv-utilization (NOT in baseline - use cautiously):
+       - score = 1.0 - KVUtilization
+       - WARNING: Becomes STALE at high request rates
+
+    HOW THE EVOLVE-BLOCK WORKS:
+    ```go
+    // Scorers run and produce scores[instanceID] for each instance
+    for i, scorer := range ws.scorers {
+        dimScores := scorer(req, snapshots)
+        for _, snap := range snapshots {
+            scores[snap.ID] += dimScores[snap.ID] * ws.weights[i]
+        }
+    }
+    // Then argmax selects instance with highest score
+    ```
+    After this loop, scores[] contains the weighted combination.
+    You can: modify scores[] after the loop, add conditional logic, change selection.
+
+    AVAILABLE SIGNALS (not used by baseline):
+    From request (req):
+      - len(req.InputTokens): total input length including shared prefix tokens
+      - req.SLOClass: "critical", "standard", "sheddable", "batch", or "background"
+      - req.SessionID: non-empty for multi-turn sessions, "" for single-turn
+
+    From instance snapshots (snap):
+      - snap.CacheHitRate: historical cache performance (0.0-1.0)
+      - snap.QueueDepth, snap.BatchSize, snap.PendingRequests: load components
+      - snap.EffectiveLoad(): total load = Queue + Batch + Pending
+      - snap.KVUtilization: memory pressure (stale at high rates)
+      - snap.FreeKVBlocks: available memory blocks
+
+    ANTI-PATTERNS TO AVOID:
+    - Don't zero out scores (scores[id] = 0) — use small multiplier (0.1) instead
+    - Don't divide without guards
+    - Don't add new keys to scores[] — only modify existing instance IDs
+
+    CRITICAL RULES:
+    1. Only modify code between EVOLVE-BLOCK-START and EVOLVE-BLOCK-END
+    2. Must compile as valid Go (failed compilation wastes an iteration)
+    3. Guard divisions to avoid NaN/Inf
+    4. bestIdx must be valid: 0 <= bestIdx < len(snapshots)
+
+    EVALUATION:
+    Your code is tested on ALL 3 workloads simultaneously. Each workload contributes
+    equally to the score (average improvement % vs baseline mean latency). Regressing
+    any workload is penalized proportionally.
+
+    WORKLOADS:
+    1. cache_warmup (rate=1000, 5000 reqs): 3 prefix groups (critical, standard SLO)
+       + 15% no-prefix background traffic. All inputs relatively short.
+    2. load_spikes (rate=1000, 5000 reqs): 60% dominant prefix group (bursty CV=4,
+       sheddable SLO), 20% critical (no prefix), 20% standard prefix group.
+    3. multiturn (rate=1000, 5000 reqs): 65% multi-turn sessions with long prefixes
+       (standard + sheddable SLO), 35% single-turn critical traffic.
+
+
+  # Number of top-performing programs to show as examples to the LLM
+  # 3 = show 3 best programs from database for inspiration
+  # Higher values = more examples but longer prompts
+  num_top_programs: 3
+
+  # Number of diverse programs to show for exploration
+  # 2 = show 2 diverse programs to encourage variation
+  # Helps prevent premature convergence to local optima
+  num_diverse_programs: 2
+
+# ----------------------------------------------------------------------------
+# Database Configuration (MAP-Elites)
+# ----------------------------------------------------------------------------
+
+database:
+  # Path where evolution database is stored
+  # Contains program archive, scores, features, and evolution history
+  db_path: "./examples/blis_router/openevolve_output/blis_router_evolution"
+
+  # Total number of programs to maintain in population across all islands
+  # 50 = good balance between diversity and efficiency
+  # Larger = more diversity but slower evolution
+  population_size: 100
+
+  # Size of elite archive (best programs regardless of features)
+  # ADRS finding: 20-100 typical; 25 balances diversity with exploitation
+  # These are always available for sampling
+  archive_size: 25
+
+  # Number of islands for island-based evolution
+  # 3 islands = good diversity without too much overhead
+  # Each island evolves independently, with periodic migration
+  # Prevents premature convergence, explores different strategies
+  num_islands: 3
+
+  # Ratio of programs selected from elite (top performers)
+  # 0.3 = 30% of samples come from top 30% of population
+  # Higher = more exploitation of known good solutions
+  # Lower = more exploration of average solutions
+  elite_selection_ratio: 0.3
+
+  # Balance between exploitation (best programs) and exploration (diverse programs)
+  # ADRS finding: 0.7/0.3 is the most common pattern (EPLB, LLM-SQL, TXN)
+  # Should sum to 1.0
+  exploitation_ratio: 0.7
+  exploration_ratio: 0.3
+
+# ----------------------------------------------------------------------------
+# Evaluator Configuration
+# ----------------------------------------------------------------------------
+
+evaluator:
+  # Timeout for each program evaluation (seconds)
+  # 300s = 5 minutes per evaluation
+  # Includes: writing file, Go build, running 3 BLIS workloads, parsing
+  # Increase if BLIS simulations are slow or workloads are large
+  timeout: 60
+
+  # Number of programs to evaluate in parallel
+  # 1 = sequential evaluation (required for BLIS since Go build is sequential)
+  # BLIS writes to same routing.go file, so can't parallelize safely
+  parallel_evaluations: 1
+
+  # Disable cascade evaluation (not implemented for BLIS)
+  # BLIS uses direct evaluation: write file → build → run → score
+  cascade_evaluation: false
+
+# ----------------------------------------------------------------------------
+# Evolution Strategy Settings
+# ----------------------------------------------------------------------------
+
+# Use diff-based mutations (show only changes to LLM)
+# true = LLM sees "old code → new code" diffs (more efficient)
+# false = LLM sees full programs (more context but larger prompts)
+# Recommended: true for code evolution
+diff_based_evolution: true
+
+# Allow LLM to rewrite entire programs (not just EVOLVE-BLOCK)
+# false = LLM can only modify EVOLVE-BLOCK section (enforced)
+# true = LLM can modify entire file (risky, may break structure)
+# Recommended: false for safety
+allow_full_rewrites: false
+
+# Maximum allowed code length (characters)
+# 20000 = sufficient for routing.go with comments (~12KB base + mutations)
+# Safety limit to prevent runaway code generation
+max_code_length: 50000
