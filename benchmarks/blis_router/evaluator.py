@@ -17,13 +17,13 @@ Positive score = better than baseline. 0 = same as baseline.
 import json
 import logging
 import os
+import platform
 import re
 import subprocess
 import traceback
 from difflib import unified_diff
 from pathlib import Path
 
-from openevolve.evaluation_result import EvaluationResult
 from hypothesis import (
     parse_hypotheses,
     test_hypotheses,
@@ -46,6 +46,7 @@ WORKLOADS = [
 
 
 SIM_MODEL = os.environ.get("BLIS_MODEL", "meta-llama/llama-3.1-8b-instruct")
+SIM_BINARY = "simulation_worker.exe" if platform.system() == "Windows" else "simulation_worker"
 
 
 def _build_sim_cmd(
@@ -53,7 +54,7 @@ def _build_sim_cmd(
 ) -> list[str]:
     """Return the simulation command list for a single workload run."""
     cmd = [
-        "./simulation_worker",
+        str(inference_sim_dir / SIM_BINARY),
         "run",
         "--model",
         SIM_MODEL,
@@ -206,12 +207,12 @@ def get_or_compute_baseline(
         dict with per-workload e2e_ms keys plus avg_e2e_ms, avg_p95_ms,
         combined_score.  Returns empty dict on failure.
     """
-    output_dir = script_dir / "openevolve_output"
+    output_dir = script_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = output_dir / "baseline_metrics.json"
     if cache_path.exists():
         try:
-            with open(cache_path, "r") as f:
+            with open(cache_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to read baseline cache, recomputing: %s", exc)
@@ -222,7 +223,7 @@ def get_or_compute_baseline(
         logger.warning("initial_program.py not found; cannot compute baseline")
         return {}
 
-    with open(initial_program_path, "r") as f:
+    with open(initial_program_path, "r", encoding="utf-8") as f:
         initial_text = f.read()
 
     go_code = extract_go_code(initial_text)
@@ -233,7 +234,7 @@ def get_or_compute_baseline(
     # Write initial routing.go
     routing_go_path = inference_sim_dir / "sim" / "routing.go"
     try:
-        with open(routing_go_path, "w") as f:
+        with open(routing_go_path, "w", encoding="utf-8") as f:
             f.write(go_code)
     except OSError as exc:
         logger.warning("Failed to write routing.go for baseline: %s", exc)
@@ -242,7 +243,7 @@ def get_or_compute_baseline(
     # Build
     try:
         build_result = subprocess.run(
-            ["go", "build", "-o", "simulation_worker", "main.go"],
+            ["go", "build", "-o", SIM_BINARY, "main.go"],
             cwd=inference_sim_dir,
             capture_output=True,
             text=True,
@@ -296,7 +297,7 @@ def get_or_compute_baseline(
 
     # Cache
     try:
-        with open(cache_path, "w") as f:
+        with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(baseline, f, indent=2)
         logger.info("Cached baseline metrics to %s", cache_path)
     except OSError as exc:
@@ -320,7 +321,7 @@ def extract_go_code(program_text: str) -> str:
     return ""
 
 
-def evaluate(program_path: str) -> EvaluationResult:
+def evaluate(program_path: str) -> dict:
     """
     Evaluate the evolved routing algorithm.
 
@@ -328,11 +329,11 @@ def evaluate(program_path: str) -> EvaluationResult:
         program_path: Path to the program file containing routing.go code
 
     Returns:
-        EvaluationResult with metrics and artifacts
+        dict with metrics and artifacts
     """
 
     # Load program text from file
-    with open(program_path, "r") as f:
+    with open(program_path, "r", encoding="utf-8") as f:
         program_text = f.read()
 
     # Get paths
@@ -348,18 +349,16 @@ def evaluate(program_path: str) -> EvaluationResult:
         logger.error("Failed to extract Go code from program")
         logger.error(f"Program text length: {len(program_text)}")
         logger.error(f"Contains GO_ROUTING_CODE: {'GO_ROUTING_CODE' in program_text}")
-        return EvaluationResult(
-            metrics={
-                "combined_score": -100000.0,
-                "avg_e2e_ms": float("inf"),
-                "error": "Failed to extract Go code",
-            },
-            artifacts={
+        return {
+            "combined_score": -100000.0,
+            "avg_e2e_ms": float("inf"),
+            "error": "Failed to extract Go code",
+            "artifacts": {
                 "error_type": "ExtractionError",
                 "error_message": "Could not find GO_ROUTING_CODE variable or valid Go code",
                 "suggestion": 'Ensure program contains GO_ROUTING_CODE = """...""" or starts with \'package sim\'',
             },
-        )
+        }
 
     logger.info(f"Extracted Go code: {len(go_code)} chars, first line: {go_code.split(chr(10))[0]}")
 
@@ -368,7 +367,7 @@ def evaluate(program_path: str) -> EvaluationResult:
     # imports, struct definitions, or other code outside the EVOLVE-BLOCK.
     initial_program_path = script_dir / "initial_program.py"
     if initial_program_path.exists():
-        with open(initial_program_path, "r") as f:
+        with open(initial_program_path, "r", encoding="utf-8") as f:
             template_go_code = extract_go_code(f.read())
         if template_go_code:
             go_code_before = go_code
@@ -383,7 +382,7 @@ def evaluate(program_path: str) -> EvaluationResult:
         try:
             initial_program_path = script_dir / "initial_program.py"
             if initial_program_path.exists():
-                with open(initial_program_path, "r") as f:
+                with open(initial_program_path, "r", encoding="utf-8") as f:
                     initial_text = f.read()
                 initial_go_code = extract_go_code(initial_text)
                 if initial_go_code:
@@ -408,31 +407,29 @@ def evaluate(program_path: str) -> EvaluationResult:
 
     # Step 2: Write evolved routing.go
     try:
-        with open(routing_go_path, "w") as f:
+        with open(routing_go_path, "w", encoding="utf-8") as f:
             f.write(go_code)
         logger.info(f"Wrote evolved routing.go to {routing_go_path}")
     except Exception as e:
         logger.error(f"Failed to write routing.go: {e}")
         logger.error(traceback.format_exc())
 
-        return EvaluationResult(
-            metrics={
-                "combined_score": -100000.0,  # Very bad score for file write failure
-                "avg_e2e_ms": float("inf"),
-                "error": f"Failed to write file: {e}",
-            },
-            artifacts={
+        return {
+            "combined_score": -100000.0,  # Very bad score for file write failure
+            "avg_e2e_ms": float("inf"),
+            "error": f"Failed to write file: {e}",
+            "artifacts": {
                 "error_type": "FileWriteError",
                 "error_message": str(e),
                 "full_traceback": traceback.format_exc(),
             },
-        )
+        }
 
     # Step 3: Build BLIS
     try:
         logger.info("Building BLIS...")
         result = subprocess.run(
-            ["go", "build", "-o", "simulation_worker", "main.go"],
+            ["go", "build", "-o", SIM_BINARY, "main.go"],
             cwd=inference_sim_dir,
             capture_output=True,
             text=True,
@@ -445,52 +442,46 @@ def evaluate(program_path: str) -> EvaluationResult:
             # Truncate error for metrics (keep full version in artifacts)
             error_summary = result.stderr.strip()[:500] if result.stderr else "Unknown build error"
 
-            return EvaluationResult(
-                metrics={
-                    "combined_score": -100000.0,  # Very bad score for build failure
-                    "avg_e2e_ms": float("inf"),
-                    "error": f"Build failed: {error_summary}",
-                },
-                artifacts={
+            return {
+                "combined_score": -100000.0,  # Very bad score for build failure
+                "avg_e2e_ms": float("inf"),
+                "error": f"Build failed: {error_summary}",
+                "artifacts": {
                     "error_type": "BuildError",
                     "error_message": "Go build failed - likely syntax error in evolved code",
                     "build_stderr": result.stderr,
                     "suggestion": "Check for Go syntax errors in the evolved EVOLVE-BLOCK section",
                 },
-            )
+            }
 
         logger.info("Build successful")
     except subprocess.TimeoutExpired:
         logger.error("Build timed out")
 
-        return EvaluationResult(
-            metrics={
-                "combined_score": -100000.0,
-                "avg_e2e_ms": float("inf"),
-                "error": "Build timeout",
-            },
-            artifacts={
+        return {
+            "combined_score": -100000.0,
+            "avg_e2e_ms": float("inf"),
+            "error": "Build timeout",
+            "artifacts": {
                 "error_type": "BuildTimeout",
                 "error_message": "Go build exceeded 60 second timeout",
                 "suggestion": "Build should be fast - this indicates a serious problem",
             },
-        )
+        }
     except Exception as e:
         logger.error(f"Build error: {e}")
         logger.error(traceback.format_exc())
 
-        return EvaluationResult(
-            metrics={
-                "combined_score": -100000.0,
-                "avg_e2e_ms": float("inf"),
-                "error": f"Build error: {e}",
-            },
-            artifacts={
+        return {
+            "combined_score": -100000.0,
+            "avg_e2e_ms": float("inf"),
+            "error": f"Build error: {e}",
+            "artifacts": {
                 "error_type": type(e).__name__,
                 "error_message": str(e),
                 "full_traceback": traceback.format_exc(),
             },
-        )
+        }
 
     # Step 4: Run simulations on 3 routing-sensitive v2 workloads
     # Validated: sabotaged (always-instance-0) is 194-416% worse than baseline.
@@ -582,22 +573,20 @@ def evaluate(program_path: str) -> EvaluationResult:
         # All workloads failed
         logger.error("All workloads failed")
 
-        return EvaluationResult(
-            metrics={
-                "combined_score": -100000.0,  # Very bad score for all failures
-                "avg_e2e_ms": float("inf"),
-                "num_successful": 0,
-                "num_failed": len(WORKLOADS),
-                "error": "All workloads failed",
-            },
-            artifacts={
+        return {
+            "combined_score": -100000.0,  # Very bad score for all failures
+            "avg_e2e_ms": float("inf"),
+            "num_successful": 0,
+            "num_failed": len(WORKLOADS),
+            "error": "All workloads failed",
+            "artifacts": {
                 "error_type": "AllWorkloadsFailed",
                 "error_message": f"All {len(WORKLOADS)} workloads failed to run or parse",
                 "failed_workloads": failed_workloads,
                 "workload_results": workload_results,
                 "suggestion": "Check BLIS simulation errors. May be routing logic causing crashes or timeouts.",
             },
-        )
+        }
 
     # Per-workload mean improvement (each workload contributes equally)
     # ADRS finding: use smooth, proportional scoring — no discontinuous flat penalties
@@ -683,7 +672,7 @@ def evaluate(program_path: str) -> EvaluationResult:
         hypothesis_results_text = format_hypothesis_results(h_results, score, baseline_score)
         logger.info(f"Hypothesis results:\n{hypothesis_results_text}")
 
-        ledger_path = script_dir / "openevolve_output" / "hypothesis_ledger.json"
+        ledger_path = script_dir / "output" / "hypothesis_ledger.json"
         ledger = load_ledger(ledger_path)
         if not ledger["baseline"] and baseline_metrics:
             ledger["baseline"] = baseline_metrics
@@ -694,7 +683,7 @@ def evaluate(program_path: str) -> EvaluationResult:
         artifacts["hypothesis_knowledge_base"] = knowledge_base_text
     else:
         # Still show knowledge base even without hypotheses in this iteration
-        ledger_path = script_dir / "openevolve_output" / "hypothesis_ledger.json"
+        ledger_path = script_dir / "output" / "hypothesis_ledger.json"
         if ledger_path.exists():
             ledger = load_ledger(ledger_path)
             knowledge_base_text = generate_knowledge_base_summary(ledger)
@@ -717,7 +706,7 @@ def evaluate(program_path: str) -> EvaluationResult:
         "num_failed": len(failed_workloads),
     }
 
-    return EvaluationResult(metrics=metrics, artifacts=artifacts)
+    return {**metrics, "artifacts": artifacts}
 
 
 if __name__ == "__main__":
@@ -731,9 +720,9 @@ if __name__ == "__main__":
     result = evaluate(str(initial_program_path))
 
     print("\nTest result:")
-    score = result.metrics.get("combined_score")
-    avg_e2e = result.metrics.get("avg_e2e_ms")
-    success_rate = result.metrics.get("success_rate")
+    score = result.get("combined_score")
+    avg_e2e = result.get("avg_e2e_ms")
+    success_rate = result.get("success_rate")
 
     print(f"  Score: {score:.2f}" if score is not None else "  Score: N/A")
     print(
