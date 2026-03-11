@@ -7,16 +7,17 @@ log_level: "INFO"
 
 llm:
   models:
-    - name: "gpt-5"
+    - name: "gcp/gemini-3-flash-preview"
       weight: 1.0
-  api_base: "https://api.openai.com/v1"
+  api_base: "https://ete-litellm.ai-models.vpc-int.res.ibm.com"
   api_key: ${OPENAI_API_KEY}
   temperature: 0.7
   top_p: 0.95
   max_tokens: 32000
   timeout: 600
   guide_models:
-    - name: "gpt-5-mini"
+    - name: "gcp/gemini-3-flash-preview"
+      api_base: "https://ete-litellm.ai-models.vpc-int.res.ibm.com"
       max_tokens: 8000
       timeout: 300
 
