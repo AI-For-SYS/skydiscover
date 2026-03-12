@@ -18,11 +18,15 @@ import json
 import logging
 import os
 import platform
+import random
 import re
+import shutil
 import subprocess
 import traceback
 from difflib import unified_diff
 from pathlib import Path
+
+from filelock import FileLock, Timeout
 
 from hypothesis import (
     parse_hypotheses,
@@ -47,6 +51,58 @@ WORKLOADS = [
 
 SIM_MODEL = os.environ.get("BLIS_MODEL", "meta-llama/llama-3.1-8b-instruct")
 SIM_BINARY = "simulation_worker.exe" if platform.system() == "Windows" else "simulation_worker"
+
+# Number of isolated evaluation slots (each slot = its own inference-sim source
+# tree + binary).  Must be >= max(config.max_parallel_iterations, 4) to avoid
+# slot contention.  Increase if you raise max_parallel_iterations above 4.
+MAX_PARALLEL_SLOTS = 4
+
+
+# ---------------------------------------------------------------------------
+# Slot pool — per-slot isolation for parallel evaluate() calls
+# ---------------------------------------------------------------------------
+
+
+def _ensure_slot_dir(slot_idx: int, slots_dir: Path, inference_sim_dir: Path) -> Path:
+    """Return (and lazily create) an isolated inference-sim copy for slot_idx."""
+    slot_dir = slots_dir / f"slot_{slot_idx}"
+    if not slot_dir.exists():
+        logger.info("Creating evaluation slot %d at %s", slot_idx, slot_dir)
+        shutil.copytree(
+            inference_sim_dir,
+            slot_dir,
+            ignore=shutil.ignore_patterns("*.exe", "simulation_worker", ".git", "__pycache__"),
+        )
+    return slot_dir
+
+
+def _acquire_slot(slots_dir: Path, inference_sim_dir: Path) -> tuple[int, Path, FileLock]:
+    """Acquire a free evaluation slot.
+
+    Phase 1: non-blocking scan across all slots.
+    Phase 2: if all busy, block on a random slot (avoids thundering herd).
+    Timeout of 450s covers the worst-case evaluation runtime (~420s) with margin.
+    """
+    slots_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase 1: try each slot without blocking
+    for idx in range(MAX_PARALLEL_SLOTS):
+        lock = FileLock(str(slots_dir / f"slot_{idx}.lock"), timeout=0)
+        try:
+            lock.acquire()
+            slot_dir = _ensure_slot_dir(idx, slots_dir, inference_sim_dir)
+            logger.debug("Acquired evaluation slot %d (immediate)", idx)
+            return idx, slot_dir, lock
+        except Timeout:
+            pass
+
+    # Phase 2: all busy — block on a random slot
+    idx = random.randrange(MAX_PARALLEL_SLOTS)
+    lock = FileLock(str(slots_dir / f"slot_{idx}.lock"), timeout=450)
+    lock.acquire()
+    slot_dir = _ensure_slot_dir(idx, slots_dir, inference_sim_dir)
+    logger.debug("Acquired evaluation slot %d (after wait)", idx)
+    return idx, slot_dir, lock
 
 
 def _build_sim_cmd(
@@ -199,17 +255,14 @@ def get_or_compute_baseline(
     """Get baseline metrics from cache or compute by running the initial program.
 
     On first call, writes the initial program's Go code to routing.go, builds,
-    runs all 5 workloads, extracts per-workload metrics, computes aggregate
-    scores, and caches to baseline_metrics.json.  Subsequent calls read from
-    cache.
-
-    Returns:
-        dict with per-workload e2e_ms keys plus avg_e2e_ms, avg_p95_ms,
-        combined_score.  Returns empty dict on failure.
+    runs all workloads, and caches to baseline_metrics.json.  Thread/process-safe
+    via FileLock.  Returns empty dict on failure.
     """
     output_dir = script_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = output_dir / "baseline_metrics.json"
+
+    # Fast path: cache already exists (no lock needed for reads)
     if cache_path.exists():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
@@ -217,93 +270,103 @@ def get_or_compute_baseline(
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to read baseline cache, recomputing: %s", exc)
 
-    # Load initial program
-    initial_program_path = script_dir / "initial_program.py"
-    if not initial_program_path.exists():
-        logger.warning("initial_program.py not found; cannot compute baseline")
-        return {}
+    # Slow path: compute baseline under a lock so parallel evaluate() calls
+    # don't race to write routing.go / build in the original inference-sim dir.
+    with FileLock(str(output_dir / "baseline.lock"), timeout=600):
+        # Re-check inside the lock in case another process just computed it
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
 
-    with open(initial_program_path, "r", encoding="utf-8") as f:
-        initial_text = f.read()
-
-    go_code = extract_go_code(initial_text)
-    if not go_code:
-        logger.warning("Could not extract Go code from initial program for baseline")
-        return {}
-
-    # Write initial routing.go
-    routing_go_path = inference_sim_dir / "sim" / "routing.go"
-    try:
-        with open(routing_go_path, "w", encoding="utf-8") as f:
-            f.write(go_code)
-    except OSError as exc:
-        logger.warning("Failed to write routing.go for baseline: %s", exc)
-        return {}
-
-    # Build
-    try:
-        build_result = subprocess.run(
-            ["go", "build", "-o", SIM_BINARY, "main.go"],
-            cwd=inference_sim_dir,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if build_result.returncode != 0:
-            logger.warning("Baseline build failed: %s", build_result.stderr[:300])
+        # Load initial program
+        initial_program_path = script_dir / "initial_program.py"
+        if not initial_program_path.exists():
+            logger.warning("initial_program.py not found; cannot compute baseline")
             return {}
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.warning("Baseline build error: %s", exc)
-        return {}
 
-    # Run all workloads
-    baseline = {}
-    latencies = []
-    tail_latencies = []
+        with open(initial_program_path, "r", encoding="utf-8") as f:
+            initial_text = f.read()
 
-    for workload_name, workload_file in WORKLOADS:
-        workload_path = script_dir / workload_file
-        cmd = _build_sim_cmd(inference_sim_dir, policy_config_path, workload_path)
+        go_code = extract_go_code(initial_text)
+        if not go_code:
+            logger.warning("Could not extract Go code from initial program for baseline")
+            return {}
+
+        # Write initial routing.go
+        routing_go_path = inference_sim_dir / "sim" / "routing.go"
         try:
-            sim_result = subprocess.run(
-                cmd,
+            with open(routing_go_path, "w", encoding="utf-8") as f:
+                f.write(go_code)
+        except OSError as exc:
+            logger.warning("Failed to write routing.go for baseline: %s", exc)
+            return {}
+
+        # Build
+        try:
+            build_result = subprocess.run(
+                ["go", "build", "-o", SIM_BINARY, "main.go"],
                 cwd=inference_sim_dir,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=60,
             )
-            if sim_result.returncode != 0:
-                logger.warning("Baseline %s failed: %s", workload_name, sim_result.stderr[:300])
-                continue
-            output_text = sim_result.stdout + (sim_result.stderr or "")
-            cluster_metrics = _parse_cluster_metrics(output_text)
-            if cluster_metrics and "e2e_mean_ms" in cluster_metrics:
-                e2e_ms = float(cluster_metrics["e2e_mean_ms"])
-                e2e_p95_ms = float(cluster_metrics.get("e2e_p95_ms", e2e_ms))
-                baseline[f"{workload_name}_e2e_ms"] = e2e_ms
-                latencies.append(e2e_ms)
-                tail_latencies.append(e2e_p95_ms)
-            else:
-                logger.warning("Baseline %s: no cluster metrics found", workload_name)
+            if build_result.returncode != 0:
+                logger.warning("Baseline build failed: %s", build_result.stderr[:300])
+                return {}
         except (subprocess.TimeoutExpired, OSError) as exc:
-            logger.warning("Baseline %s error: %s", workload_name, exc)
+            logger.warning("Baseline build error: %s", exc)
+            return {}
 
-    if latencies:
-        avg_e2e = sum(latencies) / len(latencies)
-        avg_p95 = sum(tail_latencies) / len(tail_latencies)
-        baseline["avg_e2e_ms"] = avg_e2e
-        baseline["avg_p95_ms"] = avg_p95
-        baseline["combined_score"] = 0.0  # Baseline is the reference point
+        # Run all workloads
+        baseline = {}
+        latencies = []
+        tail_latencies = []
 
-    # Cache
-    try:
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(baseline, f, indent=2)
-        logger.info("Cached baseline metrics to %s", cache_path)
-    except OSError as exc:
-        logger.warning("Failed to cache baseline metrics: %s", exc)
+        for workload_name, workload_file in WORKLOADS:
+            workload_path = script_dir / workload_file
+            cmd = _build_sim_cmd(inference_sim_dir, policy_config_path, workload_path)
+            try:
+                sim_result = subprocess.run(
+                    cmd,
+                    cwd=inference_sim_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if sim_result.returncode != 0:
+                    logger.warning("Baseline %s failed: %s", workload_name, sim_result.stderr[:300])
+                    continue
+                output_text = sim_result.stdout + (sim_result.stderr or "")
+                cluster_metrics = _parse_cluster_metrics(output_text)
+                if cluster_metrics and "e2e_mean_ms" in cluster_metrics:
+                    e2e_ms = float(cluster_metrics["e2e_mean_ms"])
+                    e2e_p95_ms = float(cluster_metrics.get("e2e_p95_ms", e2e_ms))
+                    baseline[f"{workload_name}_e2e_ms"] = e2e_ms
+                    latencies.append(e2e_ms)
+                    tail_latencies.append(e2e_p95_ms)
+                else:
+                    logger.warning("Baseline %s: no cluster metrics found", workload_name)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.warning("Baseline %s error: %s", workload_name, exc)
 
-    return baseline
+        if latencies:
+            avg_e2e = sum(latencies) / len(latencies)
+            avg_p95 = sum(tail_latencies) / len(tail_latencies)
+            baseline["avg_e2e_ms"] = avg_e2e
+            baseline["avg_p95_ms"] = avg_p95
+            baseline["combined_score"] = 0.0  # Baseline is the reference point
+
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(baseline, f, indent=2)
+            logger.info("Cached baseline metrics to %s", cache_path)
+        except OSError as exc:
+            logger.warning("Failed to cache baseline metrics: %s", exc)
+
+        return baseline
 
 
 def extract_go_code(program_text: str) -> str:
@@ -325,388 +388,389 @@ def evaluate(program_path: str) -> dict:
     """
     Evaluate the evolved routing algorithm.
 
+    Acquires an isolated evaluation slot (own inference-sim copy + binary) so
+    parallel calls don't corrupt each other's build artifacts.
+
     Args:
         program_path: Path to the program file containing routing.go code
 
     Returns:
         dict with metrics and artifacts
     """
+    script_dir = Path(__file__).parent
+    inference_sim_dir = script_dir / "inference-sim"
+    policy_config_path = script_dir / "routing_policy.yaml"
+
+    slots_dir = script_dir / "output" / "slots"
+    slot_idx, slot_dir, slot_lock = _acquire_slot(slots_dir, inference_sim_dir)
+    routing_go_path = slot_dir / "sim" / "routing.go"
 
     # Load program text from file
     with open(program_path, "r", encoding="utf-8") as f:
         program_text = f.read()
 
-    # Get paths
-    script_dir = Path(__file__).parent
-    inference_sim_dir = script_dir / "inference-sim"
-    routing_go_path = inference_sim_dir / "sim" / "routing.go"
-    policy_config_path = script_dir / "routing_policy.yaml"
-
-    # Step 1: Extract Go code from Python wrapper
-    logger.info(f"Program text preview: {program_text[:100]}...")
-    go_code = extract_go_code(program_text)
-    if not go_code:
-        logger.error("Failed to extract Go code from program")
-        logger.error(f"Program text length: {len(program_text)}")
-        logger.error(f"Contains GO_ROUTING_CODE: {'GO_ROUTING_CODE' in program_text}")
-        return {
-            "combined_score": -100000.0,
-            "avg_e2e_ms": float("inf"),
-            "error": "Failed to extract Go code",
-            "artifacts": {
-                "error_type": "ExtractionError",
-                "error_message": "Could not find GO_ROUTING_CODE variable or valid Go code",
-                "suggestion": 'Ensure program contains GO_ROUTING_CODE = """...""" or starts with \'package sim\'',
-            },
-        }
-
-    logger.info(f"Extracted Go code: {len(go_code)} chars, first line: {go_code.split(chr(10))[0]}")
-
-    # Enforce EVOLVE-BLOCK boundary: only take the evolved block, keep the rest
-    # from the initial program template. This prevents LLM diffs that modify
-    # imports, struct definitions, or other code outside the EVOLVE-BLOCK.
-    initial_program_path = script_dir / "initial_program.py"
-    if initial_program_path.exists():
-        with open(initial_program_path, "r", encoding="utf-8") as f:
-            template_go_code = extract_go_code(f.read())
-        if template_go_code:
-            go_code_before = go_code
-            go_code = enforce_evolve_block_boundary(go_code, template_go_code)
-            if go_code != go_code_before:
-                logger.info("Enforced EVOLVE-BLOCK boundary (reverted out-of-block changes)")
-
-    # Show diff vs initial program if enabled
-    show_diffs = os.environ.get("OPENEVOLVE_SHOW_DIFFS", "true").lower() == "true"
-    if show_diffs or True:
-
-        try:
-            initial_program_path = script_dir / "initial_program.py"
-            if initial_program_path.exists():
-                with open(initial_program_path, "r", encoding="utf-8") as f:
-                    initial_text = f.read()
-                initial_go_code = extract_go_code(initial_text)
-                if initial_go_code:
-                    print_diff(initial_go_code, go_code)
-        except Exception as e:
-            pass  # Silently skip if diff fails
-
-    # On the very first evaluation, get_or_compute_baseline writes the initial
-    # routing.go, builds, and runs all workloads to populate the cache.  The
-    # evolved routing.go is then written and built again in Steps 2-3 below,
-    # resulting in a double-build on the first call only.  Subsequent evals skip
-    # straight to the cached baseline so no extra build occurs.
-    baseline_metrics = get_or_compute_baseline(script_dir, inference_sim_dir, policy_config_path)
-    hypotheses = parse_hypotheses(go_code)
-
-    if hypotheses:
-        logger.info(f"Parsed {len(hypotheses)} hypotheses from evolved code")
-        for h in hypotheses:
-            logger.info(f"  H{h['id']}: {h['claim']} (EXPECT: {h['metric']} < {h['threshold']})")
-    else:
-        logger.info("No hypotheses found in evolved code")
-
-    # Step 2: Write evolved routing.go
     try:
-        with open(routing_go_path, "w", encoding="utf-8") as f:
-            f.write(go_code)
-        logger.info(f"Wrote evolved routing.go to {routing_go_path}")
-    except Exception as e:
-        logger.error(f"Failed to write routing.go: {e}")
-        logger.error(traceback.format_exc())
-
-        return {
-            "combined_score": -100000.0,  # Very bad score for file write failure
-            "avg_e2e_ms": float("inf"),
-            "error": f"Failed to write file: {e}",
-            "artifacts": {
-                "error_type": "FileWriteError",
-                "error_message": str(e),
-                "full_traceback": traceback.format_exc(),
-            },
-        }
-
-    # Step 3: Build BLIS
-    try:
-        logger.info("Building BLIS...")
-        result = subprocess.run(
-            ["go", "build", "-o", SIM_BINARY, "main.go"],
-            cwd=inference_sim_dir,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Build failed: {result.stderr}")
-
-            # Truncate error for metrics (keep full version in artifacts)
-            error_summary = result.stderr.strip()[:500] if result.stderr else "Unknown build error"
-
+        # Step 1: Extract Go code from Python wrapper
+        logger.info(f"Program text preview: {program_text[:100]}...")
+        go_code = extract_go_code(program_text)
+        if not go_code:
+            logger.error("Failed to extract Go code from program")
+            logger.error(f"Program text length: {len(program_text)}")
+            logger.error(f"Contains GO_ROUTING_CODE: {'GO_ROUTING_CODE' in program_text}")
             return {
-                "combined_score": -100000.0,  # Very bad score for build failure
+                "combined_score": -100000.0,
                 "avg_e2e_ms": float("inf"),
-                "error": f"Build failed: {error_summary}",
+                "error": "Failed to extract Go code",
                 "artifacts": {
-                    "error_type": "BuildError",
-                    "error_message": "Go build failed - likely syntax error in evolved code",
-                    "build_stderr": result.stderr,
-                    "suggestion": "Check for Go syntax errors in the evolved EVOLVE-BLOCK section",
+                    "error_type": "ExtractionError",
+                    "error_message": "Could not find GO_ROUTING_CODE variable or valid Go code",
+                    "suggestion": 'Ensure program contains GO_ROUTING_CODE = """...""" or starts with \'package sim\'',
                 },
             }
 
-        logger.info("Build successful")
-    except subprocess.TimeoutExpired:
-        logger.error("Build timed out")
+        logger.info(f"Extracted Go code: {len(go_code)} chars, first line: {go_code.split(chr(10))[0]}")
 
-        return {
-            "combined_score": -100000.0,
-            "avg_e2e_ms": float("inf"),
-            "error": "Build timeout",
-            "artifacts": {
-                "error_type": "BuildTimeout",
-                "error_message": "Go build exceeded 60 second timeout",
-                "suggestion": "Build should be fast - this indicates a serious problem",
-            },
-        }
-    except Exception as e:
-        logger.error(f"Build error: {e}")
-        logger.error(traceback.format_exc())
+        # Enforce EVOLVE-BLOCK boundary: only take the evolved block, keep the rest
+        # from the initial program template. This prevents LLM diffs that modify
+        # imports, struct definitions, or other code outside the EVOLVE-BLOCK.
+        initial_program_path = script_dir / "initial_program.py"
+        if initial_program_path.exists():
+            with open(initial_program_path, "r", encoding="utf-8") as f:
+                template_go_code = extract_go_code(f.read())
+            if template_go_code:
+                go_code_before = go_code
+                go_code = enforce_evolve_block_boundary(go_code, template_go_code)
+                if go_code != go_code_before:
+                    logger.info("Enforced EVOLVE-BLOCK boundary (reverted out-of-block changes)")
 
-        return {
-            "combined_score": -100000.0,
-            "avg_e2e_ms": float("inf"),
-            "error": f"Build error: {e}",
-            "artifacts": {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "full_traceback": traceback.format_exc(),
-            },
-        }
+        # Show diff vs initial program if enabled
+        show_diffs = os.environ.get("OPENEVOLVE_SHOW_DIFFS", "true").lower() == "true"
+        if show_diffs or True:
+            try:
+                initial_program_path = script_dir / "initial_program.py"
+                if initial_program_path.exists():
+                    with open(initial_program_path, "r", encoding="utf-8") as f:
+                        initial_text = f.read()
+                    initial_go_code = extract_go_code(initial_text)
+                    if initial_go_code:
+                        print_diff(initial_go_code, go_code)
+            except Exception as e:
+                pass  # Silently skip if diff fails
 
-    # Step 4: Run simulations on 3 routing-sensitive v2 workloads
-    # Validated: sabotaged (always-instance-0) is 194-416% worse than baseline.
-    # - cache_warmup: 3 prefix groups + no-prefix, rate=1000, 5s sim (load-aware wins)
-    # - load_spikes: heavy-hitter prefix + realtime + light prefix, rate=1000, 5s sim (prefix-only = +113%)
-    # - multiturn: multi-turn sessions (prefix=4096/2048/1024) + realtime, rate=150, 10s sim (load-only = +5.5%)
-    latencies = []
-    tail_latencies = []  # p99 latencies
-    request_counts = []  # for weighted averaging
-    workload_results = {}
-    failed_workloads = []
+        # On the very first evaluation, get_or_compute_baseline writes the initial
+        # routing.go, builds, and runs all workloads to populate the cache.  The
+        # evolved routing.go is then written and built again in Steps 2-3 below,
+        # resulting in a double-build on the first call only.  Subsequent evals skip
+        # straight to the cached baseline so no extra build occurs.
+        baseline_metrics = get_or_compute_baseline(script_dir, inference_sim_dir, policy_config_path)
+        hypotheses = parse_hypotheses(go_code)
 
-    for workload_name, workload_file in WORKLOADS:
+        if hypotheses:
+            logger.info(f"Parsed {len(hypotheses)} hypotheses from evolved code")
+            for h in hypotheses:
+                logger.info(f"  H{h['id']}: {h['claim']} (EXPECT: {h['metric']} < {h['threshold']})")
+        else:
+            logger.info("No hypotheses found in evolved code")
+
+        # Step 2: Write evolved routing.go
         try:
-            logger.info(f"Running {workload_name} workload...")
+            with open(routing_go_path, "w", encoding="utf-8") as f:
+                f.write(go_code)
+            logger.info(f"Wrote evolved routing.go to {routing_go_path}")
+        except Exception as e:
+            logger.error(f"Failed to write routing.go: {e}")
+            logger.error(traceback.format_exc())
+            return {
+                "combined_score": -100000.0,  # Very bad score for file write failure
+                "avg_e2e_ms": float("inf"),
+                "error": f"Failed to write file: {e}",
+                "artifacts": {
+                    "error_type": "FileWriteError",
+                    "error_message": str(e),
+                    "full_traceback": traceback.format_exc(),
+                },
+            }
 
-            # Workload file path (relative to script directory)
-            workload_path = script_dir / workload_file
-
-            cmd = _build_sim_cmd(inference_sim_dir, policy_config_path, workload_path)
-
+        # Step 3: Build BLIS
+        try:
+            logger.info("Building BLIS...")
             result = subprocess.run(
-                cmd, cwd=inference_sim_dir, capture_output=True, text=True, timeout=120
+                ["go", "build", "-o", SIM_BINARY, "main.go"],
+                cwd=slot_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
 
             if result.returncode != 0:
-                logger.error(f"{workload_name} workload failed: {result.stderr}")
-                failed_workloads.append(workload_name)
-                workload_results[workload_name] = {
-                    "e2e_ms": None,
-                    "error": "Simulation failed",
-                    "stderr": result.stderr[:500],
+                logger.error(f"Build failed: {result.stderr}")
+                error_summary = result.stderr.strip()[:500] if result.stderr else "Unknown build error"
+                return {
+                    "combined_score": -100000.0,  # Very bad score for build failure
+                    "avg_e2e_ms": float("inf"),
+                    "error": f"Build failed: {error_summary}",
+                    "artifacts": {
+                        "error_type": "BuildError",
+                        "error_message": "Go build failed - likely syntax error in evolved code",
+                        "build_stderr": result.stderr,
+                        "suggestion": "Check for Go syntax errors in the evolved EVOLVE-BLOCK section",
+                    },
                 }
-                continue
 
-            # Parse JSON output - BLIS outputs multiple JSON blocks with headers
-            # Format: "=== Simulation Metrics ===" followed by JSON object
-            # We want the CLUSTER aggregate (instance_id == "cluster")
+            logger.info("Build successful")
+        except subprocess.TimeoutExpired:
+            logger.error("Build timed out")
+            return {
+                "combined_score": -100000.0,
+                "avg_e2e_ms": float("inf"),
+                "error": "Build timeout",
+                "artifacts": {
+                    "error_type": "BuildTimeout",
+                    "error_message": "Go build exceeded 60 second timeout",
+                    "suggestion": "Build should be fast - this indicates a serious problem",
+                },
+            }
+        except Exception as e:
+            logger.error(f"Build error: {e}")
+            logger.error(traceback.format_exc())
+            return {
+                "combined_score": -100000.0,
+                "avg_e2e_ms": float("inf"),
+                "error": f"Build error: {e}",
+                "artifacts": {
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "full_traceback": traceback.format_exc(),
+                },
+            }
+
+        # Step 4: Run simulations on 3 routing-sensitive v2 workloads
+        # Validated: sabotaged (always-instance-0) is 194-416% worse than baseline.
+        # - cache_warmup: 3 prefix groups + no-prefix, rate=1000, 5s sim (load-aware wins)
+        # - load_spikes: heavy-hitter prefix + realtime + light prefix, rate=1000, 5s sim (prefix-only = +113%)
+        # - multiturn: multi-turn sessions (prefix=4096/2048/1024) + realtime, rate=150, 10s sim (load-only = +5.5%)
+        latencies = []
+        tail_latencies = []  # p99 latencies
+        request_counts = []  # for weighted averaging
+        workload_results = {}
+        failed_workloads = []
+
+        for workload_name, workload_file in WORKLOADS:
             try:
-                # Find all JSON blocks in the output (could be in stdout or stderr)
-                output_text = result.stdout + (result.stderr or "")
-                cluster_metrics = _parse_cluster_metrics(output_text)
+                logger.info(f"Running {workload_name} workload...")
 
-                if cluster_metrics and "e2e_mean_ms" in cluster_metrics:
-                    e2e_ms = float(cluster_metrics["e2e_mean_ms"])
-                    e2e_p95_ms = float(cluster_metrics.get("e2e_p95_ms", e2e_ms))
-                    latencies.append(e2e_ms)
-                    tail_latencies.append(e2e_p95_ms)
-                    # Get request count from simulation output (fallback to 1 for equal weight)
-                    num_requests = cluster_metrics.get("completed_requests", 1)
-                    request_counts.append(int(num_requests))
-                    workload_results[workload_name] = {
-                        "e2e_ms": e2e_ms,
-                        "e2e_p95_ms": e2e_p95_ms,
-                        "completed_requests": num_requests,
-                        "ttft_mean_ms": cluster_metrics.get("ttft_mean_ms"),
-                        "itl_mean_ms": cluster_metrics.get("itl_mean_ms"),
-                        "tokens_per_sec": cluster_metrics.get("tokens_per_sec"),
-                    }
-                    logger.info(f"{workload_name}: e2e_mean={e2e_ms:.2f}ms, p95={e2e_p95_ms:.2f}ms")
-                else:
-                    logger.error(f"Could not find cluster metrics in {workload_name} output")
+                # Workload file path (relative to script directory)
+                workload_path = script_dir / workload_file
+
+                cmd = _build_sim_cmd(slot_dir, policy_config_path, workload_path)
+
+                result = subprocess.run(
+                    cmd, cwd=slot_dir, capture_output=True, text=True, timeout=120
+                )
+
+                if result.returncode != 0:
+                    logger.error(f"{workload_name} workload failed: {result.stderr}")
                     failed_workloads.append(workload_name)
                     workload_results[workload_name] = {
                         "e2e_ms": None,
-                        "error": "Failed to find cluster metrics",
+                        "error": "Simulation failed",
+                        "stderr": result.stderr[:500],
                     }
-            except Exception as parse_error:
-                logger.error(f"Error parsing {workload_name} output: {parse_error}")
-                logger.error(f"Output sample: {output_text[:500]}")
+                    continue
+
+                # Parse JSON output - BLIS outputs multiple JSON blocks with headers
+                # Format: "=== Simulation Metrics ===" followed by JSON object
+                # We want the CLUSTER aggregate (instance_id == "cluster")
+                try:
+                    # Find all JSON blocks in the output (could be in stdout or stderr)
+                    output_text = result.stdout + (result.stderr or "")
+                    cluster_metrics = _parse_cluster_metrics(output_text)
+
+                    if cluster_metrics and "e2e_mean_ms" in cluster_metrics:
+                        e2e_ms = float(cluster_metrics["e2e_mean_ms"])
+                        e2e_p95_ms = float(cluster_metrics.get("e2e_p95_ms", e2e_ms))
+                        latencies.append(e2e_ms)
+                        tail_latencies.append(e2e_p95_ms)
+                        # Get request count from simulation output (fallback to 1 for equal weight)
+                        num_requests = cluster_metrics.get("completed_requests", 1)
+                        request_counts.append(int(num_requests))
+                        workload_results[workload_name] = {
+                            "e2e_ms": e2e_ms,
+                            "e2e_p95_ms": e2e_p95_ms,
+                            "completed_requests": num_requests,
+                            "ttft_mean_ms": cluster_metrics.get("ttft_mean_ms"),
+                            "itl_mean_ms": cluster_metrics.get("itl_mean_ms"),
+                            "tokens_per_sec": cluster_metrics.get("tokens_per_sec"),
+                        }
+                        logger.info(f"{workload_name}: e2e_mean={e2e_ms:.2f}ms, p95={e2e_p95_ms:.2f}ms")
+                    else:
+                        logger.error(f"Could not find cluster metrics in {workload_name} output")
+                        failed_workloads.append(workload_name)
+                        workload_results[workload_name] = {
+                            "e2e_ms": None,
+                            "error": "Failed to find cluster metrics",
+                        }
+                except Exception as parse_error:
+                    logger.error(f"Error parsing {workload_name} output: {parse_error}")
+                    logger.error(f"Output sample: {output_text[:500]}")
+                    failed_workloads.append(workload_name)
+                    workload_results[workload_name] = {
+                        "e2e_ms": None,
+                        "error": f"Parse error: {str(parse_error)}",
+                        "output_sample": output_text[:500],
+                    }
+
+            except subprocess.TimeoutExpired:
+                logger.error(f"{workload_name} workload timed out")
                 failed_workloads.append(workload_name)
-                workload_results[workload_name] = {
-                    "e2e_ms": None,
-                    "error": f"Parse error: {str(parse_error)}",
-                    "output_sample": output_text[:500],
-                }
+                workload_results[workload_name] = {"e2e_ms": None, "error": "Timeout (120s)"}
+            except Exception as e:
+                logger.error(f"{workload_name} workload error: {e}")
+                failed_workloads.append(workload_name)
+                workload_results[workload_name] = {"e2e_ms": None, "error": str(e)}
 
-        except subprocess.TimeoutExpired:
-            logger.error(f"{workload_name} workload timed out")
-            failed_workloads.append(workload_name)
-            workload_results[workload_name] = {"e2e_ms": None, "error": "Timeout (120s)"}
-        except Exception as e:
-            logger.error(f"{workload_name} workload error: {e}")
-            failed_workloads.append(workload_name)
-            workload_results[workload_name] = {"e2e_ms": None, "error": str(e)}
+        # Step 5: Compute score
+        if len(latencies) == 0:
+            # All workloads failed
+            logger.error("All workloads failed")
+            return {
+                "combined_score": -100000.0,  # Very bad score for all failures
+                "avg_e2e_ms": float("inf"),
+                "num_successful": 0,
+                "num_failed": len(WORKLOADS),
+                "error": "All workloads failed",
+                "artifacts": {
+                    "error_type": "AllWorkloadsFailed",
+                    "error_message": f"All {len(WORKLOADS)} workloads failed to run or parse",
+                    "failed_workloads": failed_workloads,
+                    "workload_results": workload_results,
+                    "suggestion": "Check BLIS simulation errors. May be routing logic causing crashes or timeouts.",
+                },
+            }
 
-    # Step 5: Compute score
-    if len(latencies) == 0:
-        # All workloads failed
-        logger.error("All workloads failed")
+        # Per-workload mean improvement (each workload contributes equally)
+        # ADRS finding: use smooth, proportional scoring — no discontinuous flat penalties
+        mean_improvements = []
+        regression_count = 0
+        regression_penalty = 0.0
+        REGRESSION_TOLERANCE_PCT = 1.0  # 1% tolerance before penalty kicks in
+        REGRESSION_PENALTY_RATE = 3.0  # extra cost per percentage point of regression beyond tolerance
 
-        return {
-            "combined_score": -100000.0,  # Very bad score for all failures
-            "avg_e2e_ms": float("inf"),
-            "num_successful": 0,
-            "num_failed": len(WORKLOADS),
-            "error": "All workloads failed",
-            "artifacts": {
-                "error_type": "AllWorkloadsFailed",
-                "error_message": f"All {len(WORKLOADS)} workloads failed to run or parse",
-                "failed_workloads": failed_workloads,
-                "workload_results": workload_results,
-                "suggestion": "Check BLIS simulation errors. May be routing logic causing crashes or timeouts.",
-            },
+        for workload_name, workload_file in WORKLOADS:
+            result = workload_results.get(workload_name)
+            if result is None or result.get("e2e_ms") is None:
+                continue
+            actual_mean = result["e2e_ms"]
+            baseline_mean = baseline_metrics.get(f"{workload_name}_e2e_ms")
+            if baseline_mean and baseline_mean > 0:
+                imp = (baseline_mean - actual_mean) / baseline_mean * 100.0
+                mean_improvements.append(imp)
+                if imp < -REGRESSION_TOLERANCE_PCT:
+                    regression_count += 1
+                    # Proportional penalty: 2% regression → 3pts, 5% → 12pts, 10% → 27pts
+                    excess = abs(imp) - REGRESSION_TOLERANCE_PCT
+                    regression_penalty += excess * REGRESSION_PENALTY_RATE
+
+        score = (sum(mean_improvements) / len(mean_improvements)) if mean_improvements else -100.0
+        score -= regression_penalty
+
+        # Keep raw averages for backward compat / logging
+        avg_latency = sum(latencies) / len(latencies)
+        avg_tail_latency = sum(tail_latencies) / len(tail_latencies)
+
+        # Calculate success rate
+        success_rate = len(latencies) / len(WORKLOADS)
+
+        # Log evaluation summary with improvement percentages
+        summary_lines = ["EVALUATION COMPLETE"]
+        for workload_name, workload_file in WORKLOADS:
+            result = workload_results.get(workload_name)
+            if result is not None and result.get("e2e_ms") is not None:
+                baseline_mean = baseline_metrics.get(f"{workload_name}_e2e_ms")
+                imp_str = ""
+                if baseline_mean and baseline_mean > 0:
+                    imp = (baseline_mean - result["e2e_ms"]) / baseline_mean * 100.0
+                    imp_str = f" ({imp:+.1f}%)"
+                summary_lines.append(
+                    f"  {workload_name}: mean={result['e2e_ms']:.0f}ms{imp_str}"
+                )
+            else:
+                summary_lines.append(f"  {workload_name}: FAILED")
+        avg_imp = (sum(mean_improvements) / len(mean_improvements)) if mean_improvements else 0.0
+        summary_lines.append(
+            f"  Avg improvement={avg_imp:+.1f}% regressions={regression_count} | Score: {score:.2f}"
+        )
+        logger.info(" | ".join(summary_lines))
+
+        # Prepare artifacts
+        artifacts = {
+            "workload_results": workload_results,
+            "successful_workloads": len(latencies),
+            "failed_workloads": len(failed_workloads),
+            "success_rate": f"{success_rate:.0%}",
         }
 
-    # Per-workload mean improvement (each workload contributes equally)
-    # ADRS finding: use smooth, proportional scoring — no discontinuous flat penalties
-    mean_improvements = []
-    regression_count = 0
-    regression_penalty = 0.0
-    REGRESSION_TOLERANCE_PCT = 1.0  # 1% tolerance before penalty kicks in
-    REGRESSION_PENALTY_RATE = 3.0  # extra cost per percentage point of regression beyond tolerance
-
-    for workload_name, workload_file in WORKLOADS:
-        result = workload_results.get(workload_name)
-        if result is None or result.get("e2e_ms") is None:
-            continue
-        actual_mean = result["e2e_ms"]
-        baseline_mean = baseline_metrics.get(f"{workload_name}_e2e_ms")
-        if baseline_mean and baseline_mean > 0:
-            imp = (baseline_mean - actual_mean) / baseline_mean * 100.0
-            mean_improvements.append(imp)
-            if imp < -REGRESSION_TOLERANCE_PCT:
-                regression_count += 1
-                # Proportional penalty: 2% regression → 3pts, 5% → 12pts, 10% → 27pts
-                excess = abs(imp) - REGRESSION_TOLERANCE_PCT
-                regression_penalty += excess * REGRESSION_PENALTY_RATE
-
-    score = (sum(mean_improvements) / len(mean_improvements)) if mean_improvements else -100.0
-    score -= regression_penalty
-
-    # Keep raw averages for backward compat / logging
-    avg_latency = sum(latencies) / len(latencies)
-    avg_tail_latency = sum(tail_latencies) / len(tail_latencies)
-
-    # Calculate success rate
-    success_rate = len(latencies) / len(WORKLOADS)
-
-    # Log evaluation summary with improvement percentages
-    summary_lines = ["EVALUATION COMPLETE"]
-    for workload_name, workload_file in WORKLOADS:
-        result = workload_results.get(workload_name)
-        if result is not None and result.get("e2e_ms") is not None:
-            baseline_mean = baseline_metrics.get(f"{workload_name}_e2e_ms")
-            imp_str = ""
-            if baseline_mean and baseline_mean > 0:
-                imp = (baseline_mean - result["e2e_ms"]) / baseline_mean * 100.0
-                imp_str = f" ({imp:+.1f}%)"
-            summary_lines.append(
-                f"  {workload_name}: mean={result['e2e_ms']:.0f}ms{imp_str}"
+        if failed_workloads:
+            artifacts["warning"] = f"Some workloads failed: {', '.join(failed_workloads)}"
+            artifacts["suggestion"] = (
+                "Check if evolved routing logic causes crashes or extreme slowdowns"
             )
-        else:
-            summary_lines.append(f"  {workload_name}: FAILED")
-    avg_imp = (sum(mean_improvements) / len(mean_improvements)) if mean_improvements else 0.0
-    summary_lines.append(
-        f"  Avg improvement={avg_imp:+.1f}% regressions={regression_count} | Score: {score:.2f}"
-    )
-    logger.info(" | ".join(summary_lines))
 
-    # Prepare artifacts
-    artifacts = {
-        "workload_results": workload_results,
-        "successful_workloads": len(latencies),
-        "failed_workloads": len(failed_workloads),
-        "success_rate": f"{success_rate:.0%}",
-    }
+        # Hypothesis testing
+        actual_for_hypothesis = {
+            "cache_warmup_e2e_ms": workload_results.get("cache_warmup", {}).get("e2e_ms"),
+            "load_spikes_e2e_ms": workload_results.get("load_spikes", {}).get("e2e_ms"),
+            "multiturn_e2e_ms": workload_results.get("multiturn", {}).get("e2e_ms"),
+            "avg_e2e_ms": avg_latency if latencies else None,
+            "avg_p95_ms": avg_tail_latency if tail_latencies else None,
+        }
+        actual_for_hypothesis = {k: v for k, v in actual_for_hypothesis.items() if v is not None}
 
-    if failed_workloads:
-        artifacts["warning"] = f"Some workloads failed: {', '.join(failed_workloads)}"
-        artifacts["suggestion"] = (
-            "Check if evolved routing logic causes crashes or extreme slowdowns"
-        )
+        if hypotheses:
+            h_results = test_hypotheses(hypotheses, actual_for_hypothesis, baseline_metrics)
+            baseline_score = baseline_metrics.get("combined_score", 0)
+            hypothesis_results_text = format_hypothesis_results(h_results, score, baseline_score)
+            logger.info(f"Hypothesis results:\n{hypothesis_results_text}")
 
-    # Hypothesis testing
-    actual_for_hypothesis = {
-        "cache_warmup_e2e_ms": workload_results.get("cache_warmup", {}).get("e2e_ms"),
-        "load_spikes_e2e_ms": workload_results.get("load_spikes", {}).get("e2e_ms"),
-        "multiturn_e2e_ms": workload_results.get("multiturn", {}).get("e2e_ms"),
-        "avg_e2e_ms": avg_latency if latencies else None,
-        "avg_p95_ms": avg_tail_latency if tail_latencies else None,
-    }
-    actual_for_hypothesis = {k: v for k, v in actual_for_hypothesis.items() if v is not None}
-
-    if hypotheses:
-        h_results = test_hypotheses(hypotheses, actual_for_hypothesis, baseline_metrics)
-        baseline_score = baseline_metrics.get("combined_score", 0)
-        hypothesis_results_text = format_hypothesis_results(h_results, score, baseline_score)
-        logger.info(f"Hypothesis results:\n{hypothesis_results_text}")
-
-        ledger_path = script_dir / "output" / "hypothesis_ledger.json"
-        ledger = load_ledger(ledger_path)
-        if not ledger["baseline"] and baseline_metrics:
-            ledger["baseline"] = baseline_metrics
-        update_ledger(ledger, h_results, score, ledger_path)
-        knowledge_base_text = generate_knowledge_base_summary(ledger)
-
-        artifacts["hypothesis_results"] = hypothesis_results_text
-        artifacts["hypothesis_knowledge_base"] = knowledge_base_text
-    else:
-        # Still show knowledge base even without hypotheses in this iteration
-        ledger_path = script_dir / "output" / "hypothesis_ledger.json"
-        if ledger_path.exists():
+            ledger_path = script_dir / "output" / "hypothesis_ledger.json"
             ledger = load_ledger(ledger_path)
+            if not ledger["baseline"] and baseline_metrics:
+                ledger["baseline"] = baseline_metrics
+            update_ledger(ledger, h_results, score, ledger_path)
             knowledge_base_text = generate_knowledge_base_summary(ledger)
-            if knowledge_base_text:
-                artifacts["hypothesis_knowledge_base"] = knowledge_base_text
 
-    # Return metrics
-    metrics = {
-        "combined_score": score,
-        "avg_e2e_ms": avg_latency,
-        "avg_p95_ms": avg_tail_latency,
-        "avg_mean_improvement_pct": (sum(mean_improvements) / len(mean_improvements)) if mean_improvements else 0.0,
-        "regression_count": regression_count,
-        # V2 workload metrics
-        "cache_warmup_e2e_ms": workload_results.get("cache_warmup", {}).get("e2e_ms"),
-        "load_spikes_e2e_ms": workload_results.get("load_spikes", {}).get("e2e_ms"),
-        "multiturn_e2e_ms": workload_results.get("multiturn", {}).get("e2e_ms"),
-        "success_rate": success_rate,
-        "num_successful": len(latencies),
-        "num_failed": len(failed_workloads),
-    }
+            artifacts["hypothesis_results"] = hypothesis_results_text
+            artifacts["hypothesis_knowledge_base"] = knowledge_base_text
+        else:
+            # Still show knowledge base even without hypotheses in this iteration
+            ledger_path = script_dir / "output" / "hypothesis_ledger.json"
+            if ledger_path.exists():
+                ledger = load_ledger(ledger_path)
+                knowledge_base_text = generate_knowledge_base_summary(ledger)
+                if knowledge_base_text:
+                    artifacts["hypothesis_knowledge_base"] = knowledge_base_text
 
-    return {**metrics, "artifacts": artifacts}
+        # Return metrics
+        metrics = {
+            "combined_score": score,
+            "avg_e2e_ms": avg_latency,
+            "avg_p95_ms": avg_tail_latency,
+            "avg_mean_improvement_pct": (sum(mean_improvements) / len(mean_improvements)) if mean_improvements else 0.0,
+            "regression_count": regression_count,
+            # V2 workload metrics
+            "cache_warmup_e2e_ms": workload_results.get("cache_warmup", {}).get("e2e_ms"),
+            "load_spikes_e2e_ms": workload_results.get("load_spikes", {}).get("e2e_ms"),
+            "multiturn_e2e_ms": workload_results.get("multiturn", {}).get("e2e_ms"),
+            "success_rate": success_rate,
+            "num_successful": len(latencies),
+            "num_failed": len(failed_workloads),
+        }
+
+        return {**metrics, "artifacts": artifacts}
+
+    finally:
+        slot_lock.release()
+        logger.debug("Released evaluation slot %d", slot_idx)
 
 
 if __name__ == "__main__":

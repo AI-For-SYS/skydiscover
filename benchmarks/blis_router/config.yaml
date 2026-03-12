@@ -65,7 +65,9 @@ llm:
   # Alternative options: "GCP/claude-opus-4", "gcp/gemini-2.5-pro", "GCP/gemini-2.5-flash"
   models:
     - name: "gcp/gemini-3-flash-preview"
-      weight: 1.0
+      weight: 0.8
+    - name: "gcp/gemini-3-flash-preview"
+      weight: 0.2
 
   # API base URL for custom endpoints
   api_base: https://ete-litellm.ai-models.vpc-int.res.ibm.com
