@@ -304,6 +304,7 @@ class EvaluatorConfig:
 
     timeout: int = 360
     max_retries: int = 3
+    parallel_evaluations: int = 4
 
     # Evaluation strategies
     cascade_evaluation: bool = True

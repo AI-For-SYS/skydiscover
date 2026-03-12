@@ -66,12 +66,13 @@ llm:
   models:
     - name: "gcp/gemini-3-flash-preview"
       weight: 0.8
+      api_base: https://ete-litellm.ai-models.vpc-int.res.ibm.com
     - name: "gcp/gemini-3-flash-preview"
       weight: 0.2
-
+      api_base: https://ete-litellm.ai-models.vpc-int.res.ibm.com
   # API base URL for custom endpoints
   api_base: https://ete-litellm.ai-models.vpc-int.res.ibm.com
-
+  api_key: ${OPENAI_API_KEY}
   # Temperature controls randomness in LLM generation
   # ADRS finding: most use cases use 0.7 (EPLB, LLM-SQL) or 0.9 (CBL)
   # 0.7 = balanced creativity and consistency, avoids too-random mutations
@@ -185,7 +186,7 @@ prompt:
   # Original:
   #   num_top_programs: 3
   #   num_diverse_programs: 2
-
+  
 # REMOVED: SkyDiscover does not use OpenEvolve's database section.
 # Each search algorithm manages its own population/archive internally.
 # Original:
@@ -197,6 +198,17 @@ prompt:
 #   elite_selection_ratio: 0.3
 #   exploitation_ratio: 0.7
 #   exploration_ratio: 0.3
+search:
+  type: "openevolve"
+  database:
+    db_path: "./benchmarks/blis_router/openevolve_output/blis_router_evolution"
+    population_size: 100
+    archive_size: 25
+    num_islands: 3
+    elite_selection_ratio: 0.3
+    exploitation_ratio: 0.7
+    exploration_ratio: 0.3
+    feature_dimensions: ["complexity", "diversity"]
 
 # ----------------------------------------------------------------------------
 # Evaluator Configuration
@@ -207,10 +219,12 @@ evaluator:
   # CHANGED: increased from 60s to 300s to avoid timeouts on Windows
   # Original: timeout: 60
   # Includes: writing file, Go build, running 3 BLIS workloads, parsing
-  timeout: 300
+  # timeout: 300
+  timeout: 60
 
   # REMOVED: SkyDiscover does not use parallel_evaluations (handled by search algorithm)
   # Original: parallel_evaluations: 1
+  parallel_evaluations: 1
 
   # Disable cascade evaluation (not implemented for BLIS)
   # BLIS uses direct evaluation: write file → build → run → score
