@@ -116,8 +116,9 @@ Available search algorithms:
     )
     p.add_argument("--search", "-s", default=DEFAULT_SEARCH,
                     help=f"Search algorithm (default: {DEFAULT_SEARCH})")
-    p.add_argument("--model", "-m", default=DEFAULT_MODEL,
-                    help=f"LLM model (default: {DEFAULT_MODEL})")
+    p.add_argument("--model", "-m", default=None,
+                    help="LLM model override (default: use config.yaml models); "
+                         "comma-separate for multiple, e.g. model1,model2")
     p.add_argument("--api-base", default=DEFAULT_API_BASE,
                     help="LiteLLM proxy URL")
     p.add_argument("--iterations", "-i", type=int, default=DEFAULT_ITERATIONS,
@@ -132,33 +133,44 @@ Available search algorithms:
 def main():
     args = parse_args()
 
+    if args.model:
+        model_label = args.model
+    else:
+        import yaml
+        with open("benchmarks/blis_router/config.yaml", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        first_model = cfg.get("llm", {}).get("models", [{}])[0].get("name", "config")
+        model_label = model_short_name(first_model)
     output_dir = Path(args.output_dir) if args.output_dir else build_output_dir(
-        args.search, args.model
+        args.search, model_label
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Algorithm : {args.search}")
-    print(f"Model     : {args.model}")
+    print(f"Model     : {args.model or '(from config.yaml)'}")
     print(f"Iterations: {args.iterations}")
     print(f"Output    : {output_dir}")
     print()
 
-    result = run_discovery(
+    discovery_kwargs = dict(
         initial_program="benchmarks/blis_router/initial_program.py",
         evaluator="benchmarks/blis_router/evaluator.py",
         config="benchmarks/blis_router/config.yaml",
         search=args.search,
-        model=args.model,
         api_base=args.api_base,
         output_dir=str(output_dir),
         iterations=args.iterations,
     )
+    if args.model:
+        discovery_kwargs["model"] = args.model
+
+    result = run_discovery(**discovery_kwargs)
 
     print(f"\nBest score: {result.best_score}")
     print(f"Best solution:\n{result.best_solution}")
 
     # Log to centralized scores file
-    append_to_scores_log(output_dir, args.search, args.model,
+    append_to_scores_log(output_dir, args.search, model_label,
                          args.iterations, result)
     print(f"\nScore logged to {RESULTS_ROOT / 'scores.jsonl'}")
 

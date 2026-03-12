@@ -122,3 +122,8 @@ skydiscover = [
 
 [tool.setuptools.dynamic]
 version = {attr = "skydiscover._version.__version__"}
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

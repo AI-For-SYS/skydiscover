@@ -23,7 +23,12 @@ benchmarks/blis_router/
   workload_v2_load_spikes.yaml    # Workload definition (unchanged from OpenEvolve)
   workload_v2_multiturn.yaml      # Workload definition (unchanged from OpenEvolve)
   inference-sim/              # Go simulator (git clone, pinned to specific commit)
-  output/                     # Auto-created: baseline_metrics.json, hypothesis_ledger.json
+  output/                     # Auto-created at runtime
+    baseline_metrics.json     #   Cached baseline run (delete to recompute)
+    baseline.lock             #   FileLock for baseline race protection
+    hypothesis_ledger.json    #   Accumulated hypothesis results
+    slots/                    #   Parallel evaluation slot pool
+      slot_0/ … slot_3/       #   Isolated inference-sim copies (lazily created)
 
 scripts/
   run_blis_router.py          # Entry point script using SkyDiscover Python API
@@ -50,15 +55,19 @@ regressions are penalized with `penalty = sum(regression_pcts) * (regression_cou
 | 1 | `+import platform` | Needed for Windows binary name detection | Yes — no-op on Linux |
 | 2 | `-from openevolve.evaluation_result import EvaluationResult` | SkyDiscover doesn't use this class | Yes — see return type below |
 | 3 | `+SIM_BINARY = "simulation_worker.exe" if platform.system() == "Windows" else "simulation_worker"` | Go produces `.exe` on Windows | Yes — same binary, platform-correct name |
-| 4 | `"./simulation_worker"` → `str(inference_sim_dir / SIM_BINARY)` | `./binary` doesn't work on Windows; absolute path works everywhere | Yes — same binary, resolvable path |
+| 4 | `"./simulation_worker"` → `str(slot_dir / SIM_BINARY)` | `./binary` doesn't work on Windows; slot_dir is the per-evaluation isolated copy | Yes — same binary, platform-correct path |
 | 5 | `encoding="utf-8"` added to all `open()` calls | Windows defaults to cp1252, fails on UTF-8 chars (arrows, em dashes in Go comments) | Yes — Linux already uses UTF-8 by default |
 | 6 | `"simulation_worker"` → `SIM_BINARY` in go build `-o` flag | Matches change #3 | Yes |
 | 7 | `"openevolve_output"` → `"output"` in directory references | SkyDiscover uses its own output dir naming | Yes — just a directory name |
 | 8 | `EvaluationResult(metrics={...}, artifacts={...})` → flat dict `{**metrics, "artifacts": artifacts}` | SkyDiscover evaluators return plain dicts, not framework objects | Yes — same data, different container |
 | 9 | `evaluate()` return type annotation: `EvaluationResult` → `dict` | Matches change #8 | Yes |
 | 10 | `result.metrics.get(...)` → `result.get(...)` in `__main__` block | Dict has no `.metrics` attribute — keys are top-level | Yes — same values accessed |
+| 11 | `+import random, shutil` + `+from filelock import FileLock, Timeout` | Required for slot pool implementation | Yes — new imports only |
+| 12 | `+MAX_PARALLEL_SLOTS = 4` + `+_ensure_slot_dir()` + `+_acquire_slot()` | Slot pool: isolated inference-sim copy per concurrent evaluate() call | Yes — same evaluation logic, now parallel-safe |
+| 13 | `get_or_compute_baseline()`: wrapped slow path in `FileLock("baseline.lock", timeout=600)` with double-checked re-read inside | Prevents parallel evaluate() calls from racing to write routing.go / build in the original inference-sim dir | Yes — same baseline values, now race-free |
+| 14 | `evaluate()`: acquires slot at entry, releases in `finally:` block | Ensures each concurrent call has its own routing.go + binary | Yes — same evaluation, now parallel-safe |
 
-**NOT changed:** Baseline computation, EVOLVE-BLOCK enforcement, workload execution, metric parsing, hypothesis testing, scoring formula, error handling, all thresholds and constants.
+**NOT changed:** EVOLVE-BLOCK enforcement, workload execution, metric parsing, hypothesis testing, scoring formula, error handling, all thresholds and constants.
 
 ### config.yaml — What Changed and Why
 
@@ -70,12 +79,12 @@ regressions are penalized with `penalty = sum(regression_pcts) * (regression_cou
 | Code length | `max_code_length: 50000` | `max_solution_length: 50000` | Renamed key, same value |
 | Database section | `database: { population_size, num_islands, ... }` | *(removed)* | SkyDiscover search algorithms manage their own populations |
 | Prompt settings | `num_top_programs: 3`, `num_diverse_programs: 2` | *(removed)* | Handled internally by each search algorithm |
-| Eval parallelism | `parallel_evaluations: 1` | *(removed from config)* | Forced to 1 in `openevolve_backend.py` (see note below) |
+| Eval parallelism | `parallel_evaluations: 1` | *(removed from config)* | Handled by slot pool in `evaluator.py` (see note below) |
 | Eval timeout | `timeout: 60` | `timeout: 300` | Increased for Windows (Go builds slower, ~30s vs ~5s) |
 
 **Preserved identically:** `system_message` (entire prompt), `max_iterations: 100`, `checkpoint_interval: 5`, `log_level: "INFO"`, `temperature: 0.7`, `top_p: null`, `max_tokens: 40000`, `timeout: 120`, `cascade_evaluation: false`.
 
-**Why parallel evaluation is impossible for this benchmark:** The original OpenEvolve evaluator was not designed for parallel execution — it writes evolved Go code to a single hardcoded path (`inference-sim/sim/routing.go`), compiles it into a single binary (`simulation_worker.exe` / `simulation_worker`), and runs that binary for each workload. All paths are fixed, so if multiple evaluations run concurrently, they overwrite each other's source file, corrupt the build output, or fail with "file being used by another process" errors. The original OpenEvolve config explicitly set `parallel_evaluations: 1` for this reason. In SkyDiscover, this is enforced in `openevolve_backend.py` since the config key doesn't exist in SkyDiscover's schema.
+**Parallel evaluation — slot pool:** The evaluator uses a pool of `MAX_PARALLEL_SLOTS = 4` isolated copies of the `inference-sim` source tree (`output/slots/slot_0/` … `slot_3/`). Each concurrent `evaluate()` call acquires a free slot via `FileLock`, writes its own `routing.go`, builds its own binary, and releases the slot when done. This matches the default framework concurrency of `max(max_parallel_iterations, 4) = 4`. If you raise `max_parallel_iterations` above 4, increase `MAX_PARALLEL_SLOTS` in `evaluator.py` accordingly.
 
 ### skydiscover/runner.py
 
@@ -85,25 +94,38 @@ regressions are penalized with `penalty = sum(regression_pcts) * (regression_cou
 
 - `max_solution_length` → `max_code_length` mapping (without this, OpenEvolve used its default 10000, rejecting mutations for blis_router whose initial program is ~12635 chars).
 - Best-program tracking fix: `controller.run()` sometimes returns a program with stale metrics. Now scans the full database for the true best `combined_score`.
-- `parallel_evaluations = 1`: forces sequential evaluation to prevent concurrent Go builds from fighting over `simulation_worker.exe`.
+- ~~`parallel_evaluations = 1`~~: removed — parallel evaluation is now handled correctly by the slot pool in `evaluator.py`.
 
 ---
 
 ## How the Evaluator Works
 
+The evaluator supports parallel execution via a **slot pool**: `MAX_PARALLEL_SLOTS = 4`
+isolated copies of the `inference-sim` source tree under `output/slots/slot_0/` … `slot_3/`.
+Each concurrent `evaluate()` call acquires a free slot using `FileLock`, works entirely
+within that slot's directory, and releases the lock when done. This prevents concurrent
+builds from corrupting each other's `routing.go` or binary. Slots are created lazily on
+first use by copying the source tree (excluding binaries and `.git`).
+
 Each evaluation cycle:
 
-1. **Extract Go code** from the Python wrapper (`GO_ROUTING_CODE = """..."""`)
-2. **Enforce EVOLVE-BLOCK boundary** — splice only the evolved block into the template, revert any out-of-block changes
-3. **Write** the Go code to `inference-sim/sim/routing.go`
-4. **Build** via `go build -o <SIM_BINARY> main.go`
-5. **Run 3 workloads** (cache_warmup, load_spikes, multiturn) — each is a separate subprocess call
-6. **Parse cluster metrics** from JSON output (e2e_mean_ms, e2e_p95_ms, completed_requests)
-7. **Compute score** using improvement-based formula (see Scoring below)
-8. **Test hypotheses** (if LLM embedded `// HYPOTHESIS-N` / `// EXPECT-N` comments)
-9. **Return dict** with `combined_score` and metrics
+1. **Acquire slot** — scan slots non-blocking for a free one; if none, block on a random
+   slot with a 450s timeout (worst case: build ~60s + 3 × 120s workloads = ~420s + margin)
+2. **Extract Go code** from the Python wrapper (`GO_ROUTING_CODE = """..."""`)
+3. **Enforce EVOLVE-BLOCK boundary** — splice only the evolved block into the template, revert any out-of-block changes
+4. **Get baseline** — read from `output/baseline_metrics.json` cache; compute and cache on first call (protected by `baseline.lock`)
+5. **Parse hypotheses** — extract any `// HYPOTHESIS-N` / `// EXPECT-N` comments from the Go code
+6. **Write** the Go code to `output/slots/slot_N/sim/routing.go`
+7. **Build** via `go build -o <SIM_BINARY> main.go` inside the slot directory
+8. **Run 3 workloads** (cache_warmup, load_spikes, multiturn) — each is a separate subprocess call
+9. **Parse cluster metrics** from JSON output (e2e_mean_ms, e2e_p95_ms, completed_requests)
+10. **Compute score** using improvement-based formula (see Scoring below)
+11. **Test hypotheses** against actual results; update `output/hypothesis_ledger.json`
+12. **Release slot** and return dict with `combined_score` and metrics
 
-**Baseline:** Computed once on first run and cached to `output/baseline_metrics.json`. Delete this file to recompute.
+**Baseline:** Computed once on first run, protected by its own `FileLock("baseline.lock")`
+to avoid duplicate computation under parallelism, and cached to `output/baseline_metrics.json`.
+Delete this file to recompute.
 
 ### Scoring
 
@@ -115,9 +137,12 @@ Per workload:
 
 Overall:
   avg_improvement = mean(improvement_pcts across all successful workloads)
-  regression_penalty = sum(abs(negative_improvement_pcts)) * (regression_count / total_workloads)
+  regression_penalty = sum((abs(improvement_pct) - 1.0) * 3.0)
+                       for each workload where improvement_pct < -1.0%
   combined_score = avg_improvement - regression_penalty
 ```
+
+Constants: `REGRESSION_TOLERANCE_PCT = 1.0` (1% tolerance before penalty), `REGRESSION_PENALTY_RATE = 3.0` (penalty multiplier per excess percentage point).
 
 | Score | Meaning |
 |-------|---------|
@@ -216,4 +241,4 @@ API key: resolved from `OPENAI_API_KEY` environment variable.
 | `[WinError 2] file not found` | Windows path issue | Use absolute path: `str(inference_sim_dir / SIM_BINARY)` |
 | Score always -100000 | Build or workload failure | Check logs for Go syntax errors or missing files |
 | Stale baseline results | Cached baseline | Delete `output/baseline_metrics.json` to recompute |
-| `file being used by another process` | Parallel builds | Ensure `parallel_evaluations = 1` (set in openevolve_backend.py) |
+| `file being used by another process` | Slot pool exhausted or stale lock | Delete `output/slots/` to reset; check `MAX_PARALLEL_SLOTS` in `evaluator.py` |
