@@ -58,11 +58,15 @@ prompt:
     - Constraints
     - Techniques to explore
 
+  num_top_programs: 3
+  num_diverse_programs: 2
+  
 # Evaluator configuration
 evaluator:
   timeout: 360
   max_retries: 3
   cascade_evaluation: true
+  parallel_evaluations: 4
   cascade_thresholds: [0.3, 0.6]
 
 # Generation settings

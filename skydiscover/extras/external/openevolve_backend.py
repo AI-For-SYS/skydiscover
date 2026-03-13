@@ -105,12 +105,30 @@ def _map_config(config: Config, iterations: Optional[int], output_dir: str):
             oe.evaluator.max_retries = config.evaluator.max_retries
         if hasattr(config.evaluator, "cascade_evaluation"):
             oe.evaluator.cascade_evaluation = config.evaluator.cascade_evaluation
+        if hasattr(config.evaluator, "parallel_evaluations"):
+            oe.evaluator.parallel_evaluations = config.evaluator.parallel_evaluations
 
     oe.diff_based_generation = config.diff_based_generation
 
     # Map max_solution_length → max_code_length
     if hasattr(config, "max_solution_length") and config.max_solution_length:
         oe.max_code_length = config.max_solution_length
+
+    # Map search.database fields → OpenEvolve database config
+    db = getattr(config.search, "database", None)
+    if db is not None:
+        for attr in ("db_path",
+                     "population_size",
+                     "archive_size",
+                     "num_islands",
+                     "elite_selection_ratio",
+                     "exploitation_ratio",
+                     "exploration_ratio",
+                     "migration_interval",
+                     "feature_dimensions"):
+            val = getattr(db, attr, None)
+            if val is not None and hasattr(oe.database, attr):
+                setattr(oe.database, attr, val)
 
     return oe
 
