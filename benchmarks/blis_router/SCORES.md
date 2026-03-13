@@ -46,6 +46,24 @@ Baseline `combined_score` = **0.0** (by definition — it's the reference point)
 
 ---
 
+## Summary: All Runs
+
+| Algorithm | Iterations | Workers | Score | cache_warmup (ms) | First Breakthrough | Duration |
+|-----------|-----------|---------|-------|-------------------|--------------------|----------|
+| OE Ground Truth | 100 | 1 | +7.66% | 4418.55 (-22.9%) | Iter 21 | ~63 min |
+| openevolve | 150 | 4 | **+8.83%** | **4215.66 (-26.5%)** | Iter ~15 | ~21 min |
+| adaevolve | 150 | 4 | +7.94% | 4423.61 (-22.8%) | Iter ~70 | ~79 min |
+| gepa_native | 150 | 1 | +7.67% | 4414.93 (-23.0%) | Iter ~13 (merge) | ~83 min |
+| evox | 150 | 1 | +7.67% | 4415.65 (-23.0%) | **Iter 1** | ~88 min |
+
+"Oracle" reference point: cache_warmup 4151ms (-27.6%) — a specific hand-crafted 5-path routing
+strategy written by the benchmark authors (`test_workloads/oracle_program.py`, commit `b859a64`),
+stored in `test_workloads/validation_results.json`. It is named "oracle" to mean "best known
+hand-crafted result", not a provably optimal ceiling. openevolve's best (4216ms) reaches 96%
+of this reference point. See Reference: Fixed-Weight Strategies section below.
+
+---
+
 ## OpenEvolve Baseline Run (Ground Truth)
 
 **Source:** Original OpenEvolve project run at
@@ -163,6 +181,182 @@ stay flat — consistent with the Oracle strategy ceiling.
 
 ---
 
+### adaevolve — 150 iterations (2026-03-12)
+
+Run configuration:
+- Model: `gcp/gemini-3-flash-preview` (via LiteLLM proxy)
+- 150 iterations, 4 parallel workers
+- Log: `blis_router_results/adaevolve_gemini-3-flash-preview/20260312_125946/`
+
+#### Best Result
+
+| Metric | Value |
+|--------|-------|
+| **combined_score** | **+7.94** |
+| avg_mean_improvement_pct | +7.94% |
+| regression_count | 0 |
+| Found at iteration | 115 |
+
+| Workload | Baseline (ms) | Best Evolved (ms) | vs Baseline | vs OE Ground Truth |
+|----------|---------------|-------------------|-------------|---------------------|
+| cache_warmup | 5734.57 | 4423.61 | **-22.8%** | +0.1% (OE: 4418.55ms, flat) |
+| load_spikes | 3667.04 | 3666.34 | -0.02% (flat) | flat |
+| multiturn | 731.70 | 724.89 | -0.93% (flat) | flat |
+
+#### Evolution Progress
+
+| Checkpoint | Score | Event |
+|------------|-------|-------|
+| 0 | 0.00 | Baseline evaluated |
+| 1–69 | all ≤ 0 | No improvement — regressions and build failures |
+| **~70** | **+7.68** | **First clean breakthrough** — cache_warmup 4428ms, zero regressions |
+| ~80 | +7.82 | Incremental improvement |
+| ~90 | +7.91 | Further improvement |
+| **115** | **+7.94** | **Final best** — cache_warmup 4424ms, zero regressions |
+| 116–150 | ≤ 7.94 | Score plateaus, no further gains |
+
+#### Run Statistics
+
+- Total evaluations: 151 (1 baseline + 150 iterations)
+- Build failures: ~44 (LLM-generated Go code issues: missing imports, type errors, syntax errors, undefined variables)
+- Run duration: ~79 minutes (12:59 – 14:18)
+
+#### Comparison with OpenEvolve Ground Truth and openevolve
+
+| Metric | OE Ground Truth (100 iter) | openevolve (150 iter) | adaevolve (150 iter) |
+|--------|---------------------------|----------------------|----------------------|
+| Best score | +7.66% | **+8.83%** | +7.94% |
+| cache_warmup | 4418.55ms (-22.9%) | **4215.66ms (-26.5%)** | 4423.61ms (-22.8%) |
+| First breakthrough | Iteration 21 | Iteration ~15 | Iteration ~70 |
+| Plateau from | Iteration 57 | Iteration 32 | Iteration 115 |
+| Workers | 1 (sequential) | 4 (parallel) | 4 (parallel) |
+
+**Conclusion:** adaevolve slightly beats the OE ground truth (+7.94% vs +7.66%) but falls
+behind openevolve (+8.83%). adaevolve took longer to find the breakthrough (iter ~70 vs ~15)
+and kept improving slowly until iter 115. Both algorithms find the same cache-warmup optimization;
+the difference in final score is within the noise of the 4424ms vs 4216ms cache_warmup result.
+
+---
+
+### gepa_native — 150 iterations (2026-03-12)
+
+Run configuration:
+- Model: `gcp/gemini-3-flash-preview` (via LiteLLM proxy)
+- 150 iterations, 1 worker (sequential — gepa_native does not use the slot pool)
+- Log: `blis_router_results/gepa_native_gemini-3-flash-preview/20260312_155007/`
+
+#### Best Result
+
+| Metric | Value |
+|--------|-------|
+| **combined_score** | **+7.67** |
+| avg_mean_improvement_pct | +7.67% |
+| regression_count | 0 |
+| Found at iteration | 14 (via LLM merge) |
+
+| Workload | Baseline (ms) | Best Evolved (ms) | vs Baseline | vs OE Ground Truth |
+|----------|---------------|-------------------|-------------|---------------------|
+| cache_warmup | 5734.57 | 4414.93 | **-23.0%** | +0.1% (OE: 4418.55ms, flat) |
+| load_spikes | 3667.04 | 3667.04 | 0.0% (flat) | flat |
+| multiturn | 731.70 | 731.70 | 0.0% (flat) | flat |
+
+#### Evolution Progress
+
+| Iteration | Score | Event |
+|-----------|-------|-------|
+| 0 | 0.00 | Baseline evaluated |
+| 1–11 | all < 0 | No improvement — all regressions |
+| **~13** | **+7.07** | **First merge ACCEPTED** — cache_warmup drops to ~4428ms |
+| **14** | **+7.67** | **Final best** — second merge ACCEPTED, cache_warmup 4415ms |
+| 15–150 | ≤ 7.67 | Score plateaus — strict acceptance gating, no further merges succeed |
+
+#### Run Statistics
+
+- Total evaluations: 297 (150 iterations × ~2 parallel evaluations per iter)
+- Build failures: 0
+- Merges attempted: 2 of 10 budget, both accepted
+- Run duration: ~83 minutes (15:50 – 17:13)
+
+#### Comparison with other algorithms
+
+| Metric | OE Ground Truth (100 iter) | openevolve (150 iter) | adaevolve (150 iter) | gepa_native (150 iter) |
+|--------|---------------------------|----------------------|----------------------|------------------------|
+| Best score | +7.66% | **+8.83%** | +7.94% | +7.67% |
+| cache_warmup | 4418.55ms (-22.9%) | **4215.66ms (-26.5%)** | 4423.61ms (-22.8%) | 4414.93ms (-23.0%) |
+| First breakthrough | Iteration 21 | Iteration ~15 | Iteration ~70 | Iteration ~13 (merge) |
+| Plateau from | Iteration 57 | Iteration 32 | Iteration 115 | Iteration 14 |
+| Workers | 1 (sequential) | 4 (parallel) | 4 (parallel) | 1 (sequential) |
+
+**Conclusion:** gepa_native found a good solution extremely fast (iteration 14, via two LLM merges)
+but then plateaued hard — strict acceptance gating prevented any progress in the remaining 136
+iterations. Final score (+7.67%) matches the OE ground truth almost exactly. The LLM merge
+mechanism is effective at bootstrapping early, but the algorithm needs a way to escape the plateau.
+
+---
+
+### evox — 150 iterations (2026-03-12)
+
+Run configuration:
+- Model: `gcp/gemini-3-flash-preview` (via LiteLLM proxy)
+- 150 iterations, 1 worker (sequential)
+- Log: `blis_router_results/evox_gemini-3-flash-preview/20260312_195008/`
+- Note: search strategy co-evolution failed on every trigger (401 errors — `gcp` provider
+  not in `_PROVIDERS` map, falls back to `api.openai.com`; `setup_search()` lacks `apply_overrides()`).
+  Run completed as plain solution evolution with evox's initial sampling strategy.
+
+#### Best Result
+
+| Metric | Value |
+|--------|-------|
+| **combined_score** | **+7.67** |
+| avg_mean_improvement_pct | +7.67% |
+| regression_count | 0 |
+| Found at iteration | 125 |
+
+| Workload | Baseline (ms) | Best Evolved (ms) | vs Baseline | vs OE Ground Truth |
+|----------|---------------|-------------------|-------------|---------------------|
+| cache_warmup | 5734.57 | 4415.65 | **-23.0%** | +0.1% (OE: 4418.55ms, flat) |
+| load_spikes | 3667.04 | 3667.04 | 0.0% (flat) | flat |
+| multiturn | 731.70 | 731.70 | 0.0% (flat) | flat |
+
+#### Evolution Progress
+
+| Iteration | Score | Event |
+|-----------|-------|-------|
+| 0 | 0.00 | Baseline evaluated |
+| **1** | **+7.64** | **Immediate breakthrough** — cache_warmup 4418ms, zero regressions |
+| 2–24 | ≤ +7.64 | No improvement |
+| **25** | **+7.655** | New best |
+| 26–67 | ≤ +7.655 | No improvement |
+| **68–69** | **+7.663** | Incremental improvements |
+| 70–124 | ≤ +7.663 | No improvement |
+| **125** | **+7.667** | **Final best** — cache_warmup 4416ms, zero regressions |
+| 126–150 | ≤ +7.667 | Score plateaus |
+
+#### Run Statistics
+
+- Total evaluations: 151 (1 baseline + 150 iterations)
+- Build failures: 0
+- Co-evolution triggers: 1 (iteration 16), all failed with 401 (see note above)
+- Run duration: ~88 minutes (19:50 – 21:18)
+
+#### Comparison with other algorithms
+
+| Metric | OE Ground Truth (100 iter) | openevolve (150 iter) | adaevolve (150 iter) | gepa_native (150 iter) | evox (150 iter) |
+|--------|---------------------------|----------------------|----------------------|------------------------|-----------------|
+| Best score | +7.66% | **+8.83%** | +7.94% | +7.67% | +7.67% |
+| cache_warmup | 4418.55ms (-22.9%) | **4215.66ms (-26.5%)** | 4423.61ms (-22.8%) | 4414.93ms (-23.0%) | 4415.65ms (-23.0%) |
+| First breakthrough | Iteration 21 | Iteration ~15 | Iteration ~70 | Iteration ~13 (merge) | **Iteration 1** |
+| Plateau from | Iteration 57 | Iteration 32 | Iteration 115 | Iteration 14 | Iteration 125 |
+| Workers | 1 (sequential) | 4 (parallel) | 4 (parallel) | 1 (sequential) | 1 (sequential) |
+
+**Conclusion:** evox found the best solution the fastest (iteration 1) but with the same final
+score as gepa_native (+7.67%). The co-evolution (meta search strategy adaptation) was disabled
+due to a bug — `gcp` provider not recognized in `_PROVIDERS`, causing all search strategy
+generation calls to hit `api.openai.com` with 401 errors. Despite this, the initial evox
+sampling strategy found a good solution immediately. Kept improving slowly until iteration 125
+with no further gains in the remaining 25 iterations.
+
 ---
 
 ## Reference: Fixed-Weight Strategies
@@ -180,6 +374,15 @@ They serve two purposes:
 **Source:** `test_workloads/validation_results.json` from
 [OpenEvolve blis branch](https://github.com/toslali-ibm/openevolve/tree/blis/examples/blis_router/test_workloads/validation_results.json),
 commit `b859a64`.
+
+`validation_results.json` is a pre-computed lookup table of simulator outputs for 5 fixed
+routing strategies, run by the benchmark authors with a deterministic random seed. Each entry
+is the result of running the full 3-workload simulation with a specific hand-coded routing
+policy — no LLM involvement. The strategies range from pathological (Sabotaged, Prefix-only)
+to best-effort (Oracle). The Oracle entry comes from `test_workloads/oracle_program.py`, a
+hand-crafted 5-path decision tree that classifies each request by SLO class, session ID, and
+input length. It is called "oracle" in the sense of "best the authors could write by hand",
+not a provably optimal solution — a better hand-crafted strategy could theoretically exist.
 
 | Strategy | Weights | cache_warmup (ms) | load_spikes (ms) | multiturn (ms) |
 |----------|---------|-------------------|-------------------|----------------|
